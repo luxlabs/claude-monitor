@@ -1,0 +1,50 @@
+# === macOS ===
+.DS_Store
+._*
+.AppleDouble
+.LSOverride
+.Spotlight-V100
+.Trashes
+
+# === Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+.venv/
+venv/
+.env/
+env/
+.python-version
+pip-log.txt
+
+# === Xcode / Swift ===
+ClaudeMonitor/.build/
+ClaudeMonitor/DerivedData/
+ClaudeMonitor/.swiftpm/
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+*.xccheckout
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+
+# === IDE ===
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# === Claude Code local settings ===
+.claude/settings.local.json
+ClaudeMonitor/.claude/settings.local.json
+
+# === Runtime output ===
+output/

@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "claude-monitor"
+version = "0.1.0"
+description = "TUI monitor for active Claude Code sessions"
+requires-python = ">=3.10"
+dependencies = [
+    "textual>=3.0",
+    "click>=8.0",
+]
+
+[project.scripts]
+claude-monitor = "claude_monitor.main:cli"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/claude_monitor"]
