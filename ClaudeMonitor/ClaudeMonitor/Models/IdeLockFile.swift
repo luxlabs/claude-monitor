@@ -17,14 +17,7 @@ struct IdeInfo: Equatable {
     let isRunning: Bool
     let workspaceFolder: String
     let appBundlePath: String?
-
-    var appIcon: NSImage {
-        if let path = appBundlePath {
-            return NSWorkspace.shared.icon(forFile: path)
-        }
-        return NSImage(systemSymbolName: "app.fill", accessibilityDescription: nil)
-            ?? NSImage()
-    }
+    let appIcon: NSImage  // cached at creation time
 
     var shortName: String {
         switch ideName {

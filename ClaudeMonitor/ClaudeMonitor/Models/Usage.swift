@@ -1,6 +1,6 @@
 import Foundation
 
-struct UsageWindow: Codable {
+struct UsageWindow: Codable, Equatable {
     let utilization: Double
     let resetsAt: String?
 
@@ -35,7 +35,7 @@ struct UsageWindow: Codable {
     }
 }
 
-struct UsageResponse: Codable {
+struct UsageResponse: Codable, Equatable {
     let fiveHour: UsageWindow?
     let sevenDay: UsageWindow?
     let sevenDaySonnet: UsageWindow?

@@ -1,10 +1,10 @@
 import Foundation
 
-struct Session: Codable, Identifiable {
+struct Session: Codable, Identifiable, Equatable {
     let sessionId: String
     let cwd: String
     let project: String
-    let status: String
+    var status: String
     let toolName: String?
     let permissionMode: String
     let model: String
@@ -15,18 +15,15 @@ struct Session: Codable, Identifiable {
     let lastUpdated: String
     let subagents: [Subagent]
 
+    /// Pre-parsed dates — computed once at decode time, not on every access.
+    /// ISO8601DateFormatter is extremely expensive (goes through ICU).
+    let startDate: Date?
+    let lastUpdatedDate: Date?
+
     var id: String { sessionId }
 
     var parsedStatus: SessionStatus {
         SessionStatus(rawValue: status) ?? .ended
-    }
-
-    var startDate: Date? {
-        ISO8601DateFormatter.flexible.date(from: startedAt)
-    }
-
-    var lastUpdatedDate: Date? {
-        ISO8601DateFormatter.flexible.date(from: lastUpdated)
     }
 
     var duration: TimeInterval? {
@@ -101,10 +98,30 @@ struct Session: Codable, Identifiable {
         startedAt = try c.decodeIfPresent(String.self, forKey: .startedAt) ?? ""
         lastUpdated = try c.decodeIfPresent(String.self, forKey: .lastUpdated) ?? ""
         subagents = try c.decodeIfPresent([Subagent].self, forKey: .subagents) ?? []
+        // Parse dates once at decode time (ISO8601DateFormatter is very expensive)
+        startDate = ISO8601DateFormatter.flexible.date(from: startedAt)
+        lastUpdatedDate = ISO8601DateFormatter.flexible.date(from: lastUpdated)
+    }
+
+    // Custom Equatable: exclude pre-parsed dates (derived from startedAt/lastUpdated)
+    static func == (lhs: Session, rhs: Session) -> Bool {
+        lhs.sessionId == rhs.sessionId
+            && lhs.cwd == rhs.cwd
+            && lhs.project == rhs.project
+            && lhs.status == rhs.status
+            && lhs.toolName == rhs.toolName
+            && lhs.permissionMode == rhs.permissionMode
+            && lhs.model == rhs.model
+            && lhs.topic == rhs.topic
+            && lhs.lastPrompt == rhs.lastPrompt
+            && lhs.toolCount == rhs.toolCount
+            && lhs.startedAt == rhs.startedAt
+            && lhs.lastUpdated == rhs.lastUpdated
+            && lhs.subagents == rhs.subagents
     }
 }
 
-struct Subagent: Codable, Identifiable {
+struct Subagent: Codable, Identifiable, Equatable {
     let agentId: String
     let agentType: String
     let status: String
