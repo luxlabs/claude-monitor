@@ -105,7 +105,7 @@ stateDiagram-v2
 | Hook event | Effect | Notes |
 |---|---|---|
 | `SessionStart` | `STARTING` | Records the model. `source: compact` keeps the status; other sources reset subagents, prompts and errors. Runs the GC of dead sessions' files |
-| `UserPromptSubmit` | `THINKING` | Human prompts become the topic. Prompts Claude Code submits itself (`<task-notification>`, `<teammate-message>`, `<cross-session-message>`) don't. `session_title` sets the custom title |
+| `UserPromptSubmit` | `THINKING` | Human prompts become the topic. Prompts Claude Code submits itself (`<task-notification>`, `<agent-message>`, `<teammate-message>`, `<cross-session-message>`) don't. `session_title` sets the custom title |
 | `PreToolUse` | `EXECUTING` | `ExitPlanMode` / `AskUserQuestion` also add a pending prompt |
 | `PermissionRequest` | pending prompt | Late deliveries (after the call finished or the turn ended) are ignored, using a fingerprint of `tool_input` |
 | `PermissionDenied` | `THINKING` | Auto mode refused the call; the tool never runs |
