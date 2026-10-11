@@ -1,0 +1,202 @@
+{
+  "description": "Shared cases for effective(): live.py (Python) and Merge.swift must both pass them. 'hook' uses the session file's schema-2 field names; 'live' uses the field names of `claude agents --json`.",
+  "constants": {
+    "FRESH_MARGIN": 2.0,
+    "SNAPSHOT_MAX_AGE": 15.0,
+    "ABSENT_GRACE": 90.0,
+    "BACKGROUND_DECAY": 1800.0,
+    "IDLE_HIDE_AFTER": 14400.0,
+    "LEGACY_ACTIVE_HIDE": 3600.0
+  },
+  "cases": [
+    {
+      "name": "no snapshot: hooks-only legacy mode",
+      "now": 100000.0, "observed_at": null,
+      "hook": {"base_status": "THINKING", "pending": {}, "status_ts": 99990.0, "activity_ts": 99995.0},
+      "live": null,
+      "expect": {"status": "THINKING", "detail": null, "hidden": false, "legacy": true, "untracked": false, "stale_idle": false}
+    },
+    {
+      "name": "snapshot older than 15 s: legacy mode",
+      "now": 100000.0, "observed_at": 99980.0,
+      "hook": {"base_status": "THINKING", "pending": {}, "status_ts": 99990.0, "activity_ts": 99995.0},
+      "live": null,
+      "expect": {"status": "THINKING", "detail": null, "hidden": false, "legacy": true, "untracked": false, "stale_idle": false}
+    },
+    {
+      "name": "legacy: an active status silent for over an hour is presumed dead",
+      "now": 100000.0, "observed_at": null,
+      "hook": {"base_status": "EXECUTING", "pending": {}, "status_ts": 96000.0, "activity_ts": 96000.0},
+      "live": null,
+      "expect": {"status": "EXECUTING", "detail": null, "hidden": true, "legacy": true, "untracked": false, "stale_idle": false}
+    },
+    {
+      "name": "legacy: a pending prompt shows as PERMISSION",
+      "now": 100000.0, "observed_at": null,
+      "hook": {"base_status": "THINKING", "pending": {"main": {"tool": "Bash", "fp": "abc", "since": 99990.0}}, "status_ts": 99980.0, "activity_ts": 99990.0},
+      "live": null,
+      "expect": {"status": "PERMISSION", "detail": null, "hidden": false, "legacy": true, "untracked": false, "stale_idle": false}
+    },
+    {
+      "name": "absent from a fresh snapshot but active in the last 90 s: still shown",
+      "now": 100000.0, "observed_at": 99999.0,
+      "hook": {"base_status": "WAITING", "pending": {}, "status_ts": 99950.0, "activity_ts": 99950.0},
+      "live": null,
+      "expect": {"status": "WAITING", "detail": null, "hidden": false, "legacy": false, "untracked": false, "stale_idle": false}
+    },
+    {
+      "name": "absent from a fresh snapshot and silent for 90 s: hidden",
+      "now": 100000.0, "observed_at": 99999.0,
+      "hook": {"base_status": "WAITING", "pending": {}, "status_ts": 99900.0, "activity_ts": 99900.0},
+      "live": null,
+      "expect": {"status": "WAITING", "detail": null, "hidden": true, "legacy": false, "untracked": false, "stale_idle": false}
+    },
+    {
+      "name": "live data older than the hook's last transition + 2 s: hook wins",
+      "now": 100000.0, "observed_at": 99999.0,
+      "hook": {"base_status": "THINKING", "pending": {}, "status_ts": 99998.5, "activity_ts": 99998.5},
+      "live": {"sessionId": "s", "pid": 1, "kind": "interactive", "status": "idle"},
+      "expect": {"status": "THINKING", "detail": null, "hidden": false, "legacy": false, "untracked": false, "stale_idle": false}
+    },
+    {
+      "name": "live waiting on a permission prompt",
+      "now": 100000.0, "observed_at": 99999.0,
+      "hook": {"base_status": "EXECUTING", "pending": {}, "status_ts": 99990.0, "activity_ts": 99990.0},
+      "live": {"sessionId": "s", "pid": 1, "kind": "interactive", "status": "waiting", "waitingFor": "permission prompt"},
+      "expect": {"status": "PERMISSION", "detail": "permission prompt", "hidden": false, "legacy": false, "untracked": false, "stale_idle": false}
+    },
+    {
+      "name": "live waiting because the user opened a dialog: not a request",
+      "now": 100000.0, "observed_at": 99999.0,
+      "hook": {"base_status": "WAITING", "pending": {}, "status_ts": 99990.0, "activity_ts": 99990.0},
+      "live": {"sessionId": "s", "pid": 1, "kind": "interactive", "status": "waiting", "waitingFor": "dialog open"},
+      "expect": {"status": "WAITING", "detail": null, "hidden": false, "legacy": false, "untracked": false, "stale_idle": false}
+    },
+    {
+      "name": "live idle unsticks THINKING (Esc fires no Stop)",
+      "now": 100000.0, "observed_at": 99999.0,
+      "hook": {"base_status": "THINKING", "pending": {}, "status_ts": 99990.0, "activity_ts": 99990.0},
+      "live": {"sessionId": "s", "pid": 1, "kind": "interactive", "status": "idle"},
+      "expect": {"status": "WAITING", "detail": null, "hidden": false, "legacy": false, "untracked": false, "stale_idle": false}
+    },
+    {
+      "name": "live idle clears an answered main prompt",
+      "now": 100000.0, "observed_at": 99999.0,
+      "hook": {"base_status": "EXECUTING", "pending": {"main": {"tool": "ExitPlanMode", "fp": "abc", "since": 99990.0}}, "status_ts": 99985.0, "activity_ts": 99990.0},
+      "live": {"sessionId": "s", "pid": 1, "kind": "interactive", "status": "idle"},
+      "expect": {"status": "WAITING", "detail": null, "hidden": false, "legacy": false, "untracked": false, "stale_idle": false}
+    },
+    {
+      "name": "live idle keeps BACKGROUND (agents still running)",
+      "now": 100000.0, "observed_at": 99999.0,
+      "hook": {"base_status": "BACKGROUND", "pending": {}, "status_ts": 99990.0, "activity_ts": 99990.0},
+      "live": {"sessionId": "s", "pid": 1, "kind": "interactive", "status": "idle"},
+      "expect": {"status": "BACKGROUND", "detail": null, "hidden": false, "legacy": false, "untracked": false, "stale_idle": false}
+    },
+    {
+      "name": "live idle drops a subagent prompt Claude Code no longer waits on",
+      "now": 100000.0, "observed_at": 99999.0,
+      "hook": {"base_status": "WAITING", "pending": {"a1": {"tool": "Bash", "fp": "abc", "since": 99990.0}}, "status_ts": 99980.0, "activity_ts": 99990.0},
+      "live": {"sessionId": "s", "pid": 1, "kind": "interactive", "status": "idle"},
+      "expect": {"status": "WAITING", "detail": null, "hidden": false, "legacy": false, "untracked": false, "stale_idle": false}
+    },
+    {
+      "name": "live busy wakes WAITING (work started without a prompt)",
+      "now": 100000.0, "observed_at": 99999.0,
+      "hook": {"base_status": "WAITING", "pending": {}, "status_ts": 99990.0, "activity_ts": 99990.0},
+      "live": {"sessionId": "s", "pid": 1, "kind": "interactive", "status": "busy"},
+      "expect": {"status": "THINKING", "detail": null, "hidden": false, "legacy": false, "untracked": false, "stale_idle": false}
+    },
+    {
+      "name": "live busy wakes STARTING",
+      "now": 100000.0, "observed_at": 99999.0,
+      "hook": {"base_status": "STARTING", "pending": {}, "status_ts": 99990.0, "activity_ts": 99990.0},
+      "live": {"sessionId": "s", "pid": 1, "kind": "interactive", "status": "busy"},
+      "expect": {"status": "THINKING", "detail": null, "hidden": false, "legacy": false, "untracked": false, "stale_idle": false}
+    },
+    {
+      "name": "live busy clears an answered main prompt (approved tool still running)",
+      "now": 100000.0, "observed_at": 99999.0,
+      "hook": {"base_status": "EXECUTING", "pending": {"main": {"tool": "Bash", "fp": "abc", "since": 99990.0}}, "status_ts": 99990.0, "activity_ts": 99990.0},
+      "live": {"sessionId": "s", "pid": 1, "kind": "interactive", "status": "busy"},
+      "expect": {"status": "EXECUTING", "detail": null, "hidden": false, "legacy": false, "untracked": false, "stale_idle": false}
+    },
+    {
+      "name": "live busy keeps BACKGROUND",
+      "now": 100000.0, "observed_at": 99999.0,
+      "hook": {"base_status": "BACKGROUND", "pending": {}, "status_ts": 99990.0, "activity_ts": 99990.0},
+      "live": {"sessionId": "s", "pid": 1, "kind": "interactive", "status": "busy"},
+      "expect": {"status": "BACKGROUND", "detail": null, "hidden": false, "legacy": false, "untracked": false, "stale_idle": false}
+    },
+    {
+      "name": "live busy keeps COMPACTING",
+      "now": 100000.0, "observed_at": 99999.0,
+      "hook": {"base_status": "COMPACTING", "pending": {}, "status_ts": 99990.0, "activity_ts": 99990.0},
+      "live": {"sessionId": "s", "pid": 1, "kind": "interactive", "status": "busy"},
+      "expect": {"status": "COMPACTING", "detail": null, "hidden": false, "legacy": false, "untracked": false, "stale_idle": false}
+    },
+    {
+      "name": "BACKGROUND with no activity for 30 min decays to WAITING",
+      "now": 100000.0, "observed_at": null,
+      "hook": {"base_status": "BACKGROUND", "pending": {}, "status_ts": 98000.0, "activity_ts": 98000.0},
+      "live": null,
+      "expect": {"status": "WAITING", "detail": null, "hidden": false, "legacy": true, "untracked": false, "stale_idle": false}
+    },
+    {
+      "name": "WAITING for over 4 h is stale idle (hidden unless 'show all')",
+      "now": 100000.0, "observed_at": 99999.0,
+      "hook": {"base_status": "WAITING", "pending": {}, "status_ts": 85000.0, "activity_ts": 85000.0},
+      "live": {"sessionId": "s", "pid": 1, "kind": "interactive", "status": "idle"},
+      "expect": {"status": "WAITING", "detail": null, "hidden": false, "legacy": false, "untracked": false, "stale_idle": true}
+    },
+    {
+      "name": "a prompt newer than the observation is not overridden",
+      "now": 100000.0, "observed_at": 99999.5,
+      "hook": {"base_status": "EXECUTING", "pending": {"main": {"tool": "Bash", "fp": "abc", "since": 99998.5}}, "status_ts": 99990.0, "activity_ts": 99998.5},
+      "live": {"sessionId": "s", "pid": 1, "kind": "interactive", "status": "idle"},
+      "expect": {"status": "PERMISSION", "detail": null, "hidden": false, "legacy": false, "untracked": false, "stale_idle": false}
+    },
+    {
+      "name": "background session blocked (no process): needs input",
+      "now": 100000.0, "observed_at": 99999.0,
+      "hook": {"base_status": "THINKING", "pending": {}, "status_ts": 99990.0, "activity_ts": 99990.0},
+      "live": {"sessionId": "s", "id": "7c5dcf5d", "kind": "background", "state": "blocked"},
+      "expect": {"status": "PERMISSION", "detail": null, "hidden": false, "legacy": false, "untracked": false, "stale_idle": false}
+    },
+    {
+      "name": "untracked live session, busy",
+      "now": 100000.0, "observed_at": 99999.0,
+      "hook": null,
+      "live": {"sessionId": "s", "pid": 1, "kind": "interactive", "status": "busy"},
+      "expect": {"status": "THINKING", "detail": null, "hidden": false, "legacy": false, "untracked": true, "stale_idle": false}
+    },
+    {
+      "name": "untracked live session, idle: hidden unless 'show all'",
+      "now": 100000.0, "observed_at": 99999.0,
+      "hook": null,
+      "live": {"sessionId": "s", "pid": 1, "kind": "interactive", "status": "idle"},
+      "expect": {"status": "WAITING", "detail": null, "hidden": false, "legacy": false, "untracked": true, "stale_idle": true}
+    },
+    {
+      "name": "untracked live session waiting on a permission prompt",
+      "now": 100000.0, "observed_at": 99999.0,
+      "hook": null,
+      "live": {"sessionId": "s", "pid": 1, "kind": "interactive", "status": "waiting", "waitingFor": "permission prompt"},
+      "expect": {"status": "PERMISSION", "detail": "permission prompt", "hidden": false, "legacy": false, "untracked": true, "stale_idle": false}
+    },
+    {
+      "name": "untracked background session blocked",
+      "now": 100000.0, "observed_at": 99999.0,
+      "hook": null,
+      "live": {"sessionId": "s", "id": "7c5dcf5d", "kind": "background", "state": "blocked"},
+      "expect": {"status": "PERMISSION", "detail": null, "hidden": false, "legacy": false, "untracked": true, "stale_idle": false}
+    },
+    {
+      "name": "untracked session with a dialog open counts as idle",
+      "now": 100000.0, "observed_at": 99999.0,
+      "hook": null,
+      "live": {"sessionId": "s", "pid": 1, "kind": "interactive", "status": "waiting", "waitingFor": "dialog open"},
+      "expect": {"status": "WAITING", "detail": null, "hidden": false, "legacy": false, "untracked": true, "stale_idle": true}
+    }
+  ]
+}

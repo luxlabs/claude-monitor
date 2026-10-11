@@ -1,0 +1,23 @@
+{
+  "session_id": "abc-123",
+  "cwd": "/path/to/project",
+  "project": "my-project",
+  "status": "PERMISSION",
+  "tool_name": "ExitPlanMode",
+  "permission_mode": "default",
+  "model": "claude-opus-4-8",
+  "topic": "Implement feature X",
+  "title": "Feature X implementation",
+  "last_prompt": "Implement feature X",
+  "tool_count": 12,
+  "started_at": "2025-01-15T10:30:00+00:00",
+  "last_updated": "2025-01-15T10:35:22+00:00",
+  "subagents": [
+    {
+      "agent_id": "sub-456",
+      "agent_type": "Explore",
+      "status": "running",
+      "last_updated": "2025-01-15T10:34:00+00:00"
+    }
+  ]
+}

@@ -1,0 +1,52 @@
+{
+  "models": [
+    ["claude-opus-5-5", "opus 5.5"],
+    ["claude-opus-5-5[1m]", "opus 5.5"],
+    ["claude-opus-5", "opus 5"],
+    ["claude-sonnet-5-5", "sonnet 5.5"],
+    ["claude-haiku-5-5", "haiku 5.5"],
+    ["claude-fable-5-1", "fable 5.1"],
+    ["claude-mythos-5", "mythos 5"],
+    ["claude-opus-4-8", "opus 4.8"],
+    ["claude-opus-4-20250514", "opus 4"],
+    ["claude-sonnet-4-5-20250929", "sonnet 4.5"],
+    ["claude-3-5-sonnet-20241022", "sonnet 3.5"],
+    ["claude-3-opus-20240229", "opus 3"],
+    ["us.anthropic.claude-opus-5-5-v1:0", "opus 5.5"],
+    ["claude-opus-5-5@20260101", "opus 5.5"],
+    ["Claude-Sonnet-5-5", "sonnet 5.5"],
+    ["opusplan", "opus"],
+    ["gpt-4o", "gpt-4o"],
+    ["", "-"]
+  ],
+  "modes": [
+    ["default", "manual"],
+    ["plan", "plan"],
+    ["acceptEdits", "accept"],
+    ["auto", "auto"],
+    ["dontAsk", "dontAsk"],
+    ["bypassPermissions", "bypass"],
+    ["somethingNew", "somethingNew"],
+    ["", "-"]
+  ],
+  "limits": [
+    [{"kind": "session", "percent": 10}, "Session"],
+    [{"kind": "weekly_all", "percent": 23}, "Week"],
+    [{"kind": "weekly_scoped", "percent": 0, "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null}}, "Week (Fable)"],
+    [{"kind": "weekly_scoped", "percent": 0, "scope": null}, "Week (model)"],
+    [{"kind": "spend_limit", "percent": 5}, "Spend"],
+    [{"kind": "monthly_credits", "percent": 1}, "Monthly credits"],
+    [{"percent": 1}, "Limit"]
+  ],
+  "tokens": [
+    [0, "-"],
+    [999, "999"],
+    [1000, "1k"],
+    [1499, "1k"],
+    [1500, "2k"],
+    [412345, "412k"],
+    [999499, "999k"],
+    [1000000, "1.0M"],
+    [1260000, "1.3M"]
+  ]
+}
