@@ -130,6 +130,23 @@ class HandleHookTest(TempDirs):
             hook.main()
 
 
+class ProjectNameTest(TempDirs):
+    def test_repo_worktree_and_plain_dir(self):
+        repo = self.root / "myrepo"
+        (repo / ".git" / "worktrees" / "feat").mkdir(parents=True)
+        (repo / "src").mkdir()
+        wt = repo / ".claude" / "worktrees" / "feat"
+        (wt / "pkg").mkdir(parents=True)
+        (wt / ".git").write_text(f"gitdir: {repo}/.git/worktrees/feat\n")
+        sub = self.root / "outer" / "lib"
+        sub.mkdir(parents=True)
+        (sub / ".git").write_text("gitdir: ../.git/modules/lib\n")
+        self.assertEqual(hook.project_name(str(repo / "src")), "myrepo")
+        self.assertEqual(hook.project_name(str(wt / "pkg")), "myrepo/feat")
+        self.assertEqual(hook.project_name(str(sub)), "lib")
+        self.assertEqual(hook.project_name(str(self.root / "nogit")), "nogit")
+
+
 class TranscriptTest(TempDirs):
     def write_transcript(self, entries, filler=0):
         path = self.root / "t.jsonl"

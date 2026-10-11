@@ -124,15 +124,38 @@ class Facts:
     agent_description: str = ""
 
 
+def _worktree_repo(git_file: Path) -> str:
+    """Repository name for a linked worktree's ``.git`` file, else ""."""
+    try:
+        text = git_file.read_text().strip()
+    except OSError:
+        return ""
+    m = re.match(r"gitdir:\s*(.+)", text)
+    if not m:
+        return ""
+    gitdir = Path(m.group(1).strip())
+    if not gitdir.is_absolute():
+        gitdir = (git_file.parent / gitdir).resolve()
+    parts = gitdir.parts
+    # <repo>/.git/worktrees/<name>  (submodules use .git/modules/… instead)
+    if len(parts) >= 4 and parts[-2] == "worktrees" and parts[-3] == ".git":
+        return parts[-4]
+    return ""
+
+
 def project_name(cwd: str) -> str:
-    """Git root name, falling back to the cwd basename."""
+    """Git root name ("repo/worktree" inside a linked worktree), else the cwd basename."""
     if not cwd:
         return ""
     p = Path(cwd)
     for d in [p, *p.parents]:
+        git = d / ".git"
         try:
-            if (d / ".git").exists():
+            if git.is_dir():
                 return d.name
+            if git.is_file():
+                repo = _worktree_repo(git)
+                return f"{repo}/{d.name}" if repo else d.name
         except OSError:
             break
         if d == d.parent:
