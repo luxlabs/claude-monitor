@@ -11,7 +11,7 @@ struct ClaudeMonitorApp: App {
                 .environment(store)
                 .onAppear {
                     appDelegate.onBecomeActive = { [store] in
-                        store.resetWaitingCount()
+                        store.appDidBecomeActive()
                     }
                 }
         }

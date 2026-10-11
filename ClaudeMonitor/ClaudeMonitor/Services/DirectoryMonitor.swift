@@ -1,17 +1,20 @@
 import Foundation
 
+/// Watches one directory (entries added, removed or renamed) and calls
+/// `handler` at most once per `interval`.
+///
+/// Throttle, not debounce: the first event schedules a fire after `interval`
+/// and later events inside that window don't reschedule it. (A debounce never
+/// fires while hooks keep writing, i.e. exactly when sessions are busiest.)
 final class DirectoryMonitor: Sendable {
-    private let url: URL
     private let source: DispatchSourceFileSystemObject
-    private let fileDescriptor: Int32
 
-    init?(url: URL, queue: DispatchQueue = .global(qos: .utility), debounce: TimeInterval = 0.3, handler: @escaping @Sendable () -> Void) {
-        self.url = url
-
+    init?(url: URL, interval: TimeInterval = 0.3, handler: @escaping @Sendable () -> Void) {
         let fd = open(url.path(percentEncoded: false), O_EVTONLY)
         guard fd >= 0 else { return nil }
-        self.fileDescriptor = fd
 
+        // Serial: the event handler and the delayed fire share `throttle`.
+        let queue = DispatchQueue(label: "com.mitobit.ClaudeMonitor.DirectoryMonitor", qos: .utility)
         let source = DispatchSource.makeFileSystemObjectSource(
             fileDescriptor: fd,
             eventMask: [.write, .rename, .delete, .extend],
@@ -19,13 +22,14 @@ final class DirectoryMonitor: Sendable {
         )
         self.source = source
 
-        // Debounce: coalesce rapid FS events into a single callback
-        let pending = DispatchWorkItemBox()
+        let throttle = ThrottleState()
         source.setEventHandler {
-            pending.item?.cancel()
-            let work = DispatchWorkItem(block: handler)
-            pending.item = work
-            queue.asyncAfter(deadline: .now() + debounce, execute: work)
+            guard !throttle.scheduled else { return }
+            throttle.scheduled = true
+            queue.asyncAfter(deadline: .now() + interval) {
+                throttle.scheduled = false
+                handler()
+            }
         }
         source.setCancelHandler { close(fd) }
         source.resume()
@@ -36,8 +40,7 @@ final class DirectoryMonitor: Sendable {
     }
 }
 
-/// Thread-safe mutable box for the pending work item.
-/// Access is confined to the DirectoryMonitor's serial queue.
-private final class DispatchWorkItemBox: @unchecked Sendable {
-    var item: DispatchWorkItem?
+/// Whether a fire is pending. Only touched on the monitor's serial queue.
+private final class ThrottleState: @unchecked Sendable {
+    var scheduled = false
 }

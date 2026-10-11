@@ -4,17 +4,17 @@ struct MenuBarView: View {
     @Environment(SessionStore.self) private var store
 
     var body: some View {
-        if store.sessions.isEmpty {
+        if store.rows.isEmpty {
             Text("No active sessions")
                 .foregroundStyle(.secondary)
         } else {
-            ForEach(store.sessions) { session in
-                let status = session.parsedStatus
+            ForEach(store.rows) { row in
+                let status = row.status
                 Button {
-                    store.activateIdeWindow(for: session.sessionId)
+                    store.activateIdeWindow(for: row.id)
                 } label: {
                     Label {
-                        Text("\(session.project) — \(status.label)")
+                        Text("\(row.project) — \(status.label)")
                     } icon: {
                         Image(systemName: status.icon)
                     }

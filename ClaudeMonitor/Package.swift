@@ -9,7 +9,14 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "ClaudeMonitor",
-            path: "ClaudeMonitor"
-        )
+            path: "ClaudeMonitor",
+            // Used by the Xcode project only.
+            exclude: ["ClaudeMonitor.entitlements", "Assets.xcassets"]
+        ),
+        .testTarget(
+            name: "ClaudeMonitorTests",
+            dependencies: ["ClaudeMonitor"],
+            path: "Tests/ClaudeMonitorTests"
+        ),
     ]
 )

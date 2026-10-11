@@ -1,37 +1,135 @@
 import Foundation
 import AppKit
+import os.log
+
+private let log = Logger(subsystem: "com.mitobit.ClaudeMonitor", category: "SessionStore")
+
+/// One row of the session table: a hook session, a live session, or both.
+struct DisplayRow: Identifiable, Equatable {
+    /// The session id.
+    let id: String
+    /// Hook state; nil for an untracked live session (no hook file).
+    let session: Session?
+    /// Live data; nil when the session is absent from the latest snapshot.
+    let live: LiveEntry?
+    let effective: EffectiveState
+    /// The session's exact process, from the live data.
+    let pid: pid_t?
+
+    init(session: Session?, live: LiveEntry?, effective: EffectiveState) {
+        self.id = session?.sessionId ?? live?.sessionId ?? ""
+        self.session = session
+        self.live = live
+        self.effective = effective
+        self.pid = live?.pid
+    }
+
+    var status: SessionStatus { effective.status }
+
+    var cwd: String {
+        if let cwd = session?.cwd, !cwd.isEmpty { return cwd }
+        return live?.cwd ?? ""
+    }
+
+    /// The hook's project name; for untracked sessions the cwd's basename.
+    var project: String {
+        if let project = session?.project, !project.isEmpty { return project }
+        let cwd = self.cwd
+        return cwd.isEmpty ? "-" : (cwd as NSString).lastPathComponent
+    }
+
+    var startDate: Date? {
+        if let start = session?.startDate { return start }
+        guard let started = live?.startedAt, started > 0 else { return nil }
+        return Date(timeIntervalSince1970: started)
+    }
+
+    /// Sort key: last hook activity (unknown, i.e. 0, for untracked rows; as in the TUI).
+    var activityTs: Double {
+        session?.activityTs ?? 0
+    }
+
+    /// PERMISSION, then THINKING/EXECUTING/COMPACTING, BACKGROUND, STARTING,
+    /// WAITING; then most recent activity first.
+    static func displayOrder(_ a: DisplayRow, _ b: DisplayRow) -> Bool {
+        if a.status.sortRank != b.status.sortRank { return a.status.sortRank < b.status.sortRank }
+        if a.activityTs != b.activityTs { return a.activityTs > b.activityTs }
+        return a.id < b.id
+    }
+}
 
 @Observable
 @MainActor
 final class SessionStore {
-    private(set) var sessions: [Session] = []
-    private(set) var waitingCount: Int = 0
+    /// Displayed rows, sorted.
+    private(set) var rows: [DisplayRow] = []
+    /// Sessions that entered WAITING (after real work) since the app was last focused.
     private(set) var waitingSessions: Set<String> = []
     private(set) var usage: UsageResponse?
     private(set) var ideInfoBySessionId: [String: IdeInfo] = [:]
-    private(set) var pidsBySessionId: [String: [pid_t]] = [:]
+    /// False until the first live poll has completed.
+    private(set) var hasPolledOnce = false
+    /// Where the latest live data came from (nil until a poll succeeds).
+    private(set) var liveSource: LiveSnapshot.Source?
 
-    private var previousStates: [String: String] = [:]
-    private var attentionRequests: [String: Int] = [:]
-    private var ideLockEntries: [(lockFile: IdeLockFile, modDate: Date)] = []
-    private var ideMonitor: DirectoryMonitor?
+    /// Also show sessions idle for over 4 hours (persisted).
+    var showAll: Bool = UserDefaults.standard.bool(forKey: showAllDefaultsKey) {
+        didSet {
+            guard showAll != oldValue else { return }
+            UserDefaults.standard.set(showAll, forKey: showAllDefaultsKey)
+            refreshRows()
+        }
+    }
 
-    /// Cache: file URL → (modDate, parsed session). Only re-read files whose modDate changed.
-    private var sessionCache: [URL: (modDate: Date, session: Session)] = [:]
-
-    /// Cache for usage.json — only re-read when file modDate changes.
-    private var usageModDate: Date?
+    var waitingCount: Int { waitingSessions.count }
 
     var statusCounts: [SessionStatus: Int] {
         var counts: [SessionStatus: Int] = [:]
-        for session in sessions {
-            counts[session.parsedStatus, default: 0] += 1
+        for row in rows {
+            counts[row.status, default: 0] += 1
         }
         return counts
     }
-    private var didInitialLoad = false
-    private var monitor: DirectoryMonitor?
-    private var zombieTimer: Timer?
+
+    /// Some rows only have hook data: live status is unavailable or stale.
+    var isLiveOff: Bool {
+        hasPolledOnce && rows.contains { $0.effective.legacy }
+    }
+
+    private static let activePollInterval: TimeInterval = 5
+    private static let idlePollInterval: TimeInterval = 30
+    /// Kicks (directory changes, app activation) bring the next poll forward
+    /// but never poll more often than this: hooks write continuously while
+    /// sessions work, and each poll spawns a `claude` process.
+    private static let kickMinInterval: TimeInterval = activePollInterval
+    private static let hiddenProjects: Set<String> = ["ClaudeProbe"]
+    /// Entering WAITING from these is a finished turn: worth a badge.
+    private static let badgeSources: Set<SessionStatus> = [.thinking, .executing, .background, .compacting, .permission]
+
+    private let live = LiveSessions()
+    @ObservationIgnored private var hookSessions: [Session] = []
+    /// Latest live snapshot. A failed poll keeps the previous one: it ages
+    /// out by itself (Merge falls back to hooks-only after 15 s).
+    @ObservationIgnored private var snapshot: LiveSnapshot?
+    @ObservationIgnored private var lastPollFailed = false
+    /// File URL → (modDate, parsed session): only changed files are re-read.
+    @ObservationIgnored private var sessionCache: [URL: (modDate: Date, session: Session)] = [:]
+    /// usage.json is only re-read when its modDate changes.
+    @ObservationIgnored private var usageModDate: Date?
+
+    @ObservationIgnored private var previousStatuses: [String: SessionStatus] = [:]
+    /// Transitions are detected only once a live poll set the baseline.
+    @ObservationIgnored private var transitionsArmed = false
+    @ObservationIgnored private var attentionRequests: [String: Int] = [:]
+
+    @ObservationIgnored private var ideLockEntries: [(lockFile: IdeLockFile, modDate: Date)] = []
+    @ObservationIgnored private var monitor: DirectoryMonitor?
+    @ObservationIgnored private var ideMonitor: DirectoryMonitor?
+
+    @ObservationIgnored private var pollTask: Task<Void, Never>?
+    @ObservationIgnored private var nextPollTask: Task<Void, Never>?
+    @ObservationIgnored private var nextPollDue: Date = .distantFuture
+    @ObservationIgnored private var lastPollStarted: Date = .distantPast
 
     private let sessionsURL: URL = {
         let home = FileManager.default.homeDirectoryForCurrentUser
@@ -48,40 +146,22 @@ final class SessionStore {
         return home.appending(path: ".claude/ide")
     }()
 
-    /// After this interval in PERMISSION with no file updates,
-    /// override to WAITING (handles ExitPlanMode dismissed without Stop event).
-    private static let permissionOverrideInterval: TimeInterval = 90
-
-    private func staleThreshold(for session: Session) -> TimeInterval {
-        switch session.parsedStatus {
-        case .waiting:
-            return 4 * 60 * 60   // 4 ore — l'utente deve rispondere, teniamo visibile
-        case .permission, .thinking, .executing, .starting:
-            return 15 * 60       // 15 min — processo quasi certamente morto
-        case .ended:
-            return 24 * 60 * 60  // invariato — Claude scrive ENDED esplicitamente
-        }
-    }
-
     init() {
         startMonitoring()
     }
 
     func startMonitoring() {
-        // Guard against double-call: invalidate existing timers/monitors first
+        // Guard against double-call: drop existing monitors and timers first.
         stopMonitoring()
 
         ensureDirectory()
-        cleanupStaleFiles()
         reloadIdeLockFiles()
-        reload()
-        refreshProcessMappings()
+        loadHookFiles()
+        recompute()  // hooks-only until the first poll lands
 
-        // File system monitors (debounced at 2s — with many active sessions,
-        // shorter debounce causes too-frequent reloads)
-        monitor = DirectoryMonitor(url: sessionsURL, debounce: 2.0) { [weak self] in
+        monitor = DirectoryMonitor(url: sessionsURL, interval: 1.0) { [weak self] in
             Task { @MainActor [weak self] in
-                self?.reload()
+                self?.sessionsDirectoryChanged()
             }
         }
 
@@ -92,235 +172,310 @@ final class SessionStore {
             }
         }
 
-        // Slow timer for zombie cleanup, permission override, and process discovery.
-        // Covers cases where the session file is NOT updated (so DirectoryMonitor won't fire).
-        zombieTimer = Timer.scheduledTimer(withTimeInterval: 30.0, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.reload()
-                self?.refreshProcessMappings()
-            }
-        }
+        startPoll()
     }
 
     private func stopMonitoring() {
-        zombieTimer?.invalidate()
-        zombieTimer = nil
+        cancelScheduledPoll()
         monitor = nil
         ideMonitor = nil
     }
 
+    /// The app came to the front: clear the badge, poll at the fast cadence.
+    func appDidBecomeActive() {
+        resetWaitingCount()
+        kickPoll()
+    }
+
     func resetWaitingCount() {
-        waitingCount = 0
-        waitingSessions.removeAll()
+        if !waitingSessions.isEmpty {
+            waitingSessions.removeAll()
+        }
         updateBadge()
     }
 
     private func updateBadge() {
-        NSApp?.dockTile.badgeLabel = waitingCount > 0 ? "\(waitingCount)" : ""
+        NSApp?.dockTile.badgeLabel = waitingSessions.isEmpty ? "" : "\(waitingSessions.count)"
     }
 
-    // MARK: - Private
+    // MARK: - Hook files
 
     private func ensureDirectory() {
         try? FileManager.default.createDirectory(at: sessionsURL, withIntermediateDirectories: true)
     }
 
-    /// Delete session files older than 24h from disk.
-    /// Keeps the directory small so contentsOfDirectory is fast.
-    private func cleanupStaleFiles() {
-        let fm = FileManager.default
-        guard let files = try? fm.contentsOfDirectory(
-            at: sessionsURL,
-            includingPropertiesForKeys: [.contentModificationDateKey],
-            options: .skipsHiddenFiles
-        ) else { return }
+    private func sessionsDirectoryChanged() {
+        loadHookFiles()
+        refreshRows()
+        kickPoll()
+    }
 
-        let cutoff: TimeInterval = 24 * 60 * 60
-        let now = Date.now
-        for file in files where file.pathExtension == "json" {
-            guard let modDate = (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate else {
-                continue
-            }
-            if now.timeIntervalSince(modDate) > cutoff {
-                try? fm.removeItem(at: file)
-            }
+    /// Rebuild the rows now, unless the snapshot merely aged between
+    /// idle-cadence polls: then poll first (its completion rebuilds), since a
+    /// stale snapshot would flip every row to hooks-only mode and back and
+    /// fire spurious badge/bounce transitions.
+    private func refreshRows() {
+        let now = Date().timeIntervalSince1970
+        let stale = snapshot.map { now - $0.observedAt > Merge.snapshotMaxAge } ?? false
+        if stale && !lastPollFailed {
+            schedulePoll(after: 0)
+        } else {
+            recompute()  // fresh, not polled yet, or live data really unavailable
         }
     }
 
-    private func reload() {
+    /// Read every session file (re-parsing only changed ones). Pure read:
+    /// files are never deleted here; the hooks garbage-collect them.
+    private func loadHookFiles() {
         let fm = FileManager.default
-        let decoder = JSONDecoder()
-
-        guard let files = try? fm.contentsOfDirectory(
+        let files = (try? fm.contentsOfDirectory(
             at: sessionsURL,
             includingPropertiesForKeys: [.contentModificationDateKey],
             options: .skipsHiddenFiles
-        ) else { return }
+        )) ?? []
 
-        let maxStaleAge: TimeInterval = 24 * 60 * 60
-        let now = Date.now
-
-        // Build a set of current file URLs for cache cleanup
         var currentFiles = Set<URL>()
-
-        var loaded: [Session] = []
-        for file in files {
-            guard file.pathExtension == "json" else { continue }
-
-            // Get modification date from directory listing (free — no extra syscall)
+        var loaded: [String: Session] = [:]
+        for file in files where file.pathExtension == "json" {
+            // Modification date from the directory listing (no extra syscall).
             guard let modDate = (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate else {
                 continue
             }
-
-            // Skip files older than max stale threshold without reading them
-            if now.timeIntervalSince(modDate) > maxStaleAge { continue }
-
             currentFiles.insert(file)
 
-            // Use cached session if file hasn't changed
+            let session: Session
             if let cached = sessionCache[file], cached.modDate == modDate {
-                let session = cached.session
-                if let updated = session.lastUpdatedDate,
-                   now.timeIntervalSince(updated) > staleThreshold(for: session) {
+                session = cached.session
+            } else {
+                guard let data = try? Data(contentsOf: file),
+                      let decoded = try? Session.decode(data, fallbackId: file.deletingPathExtension().lastPathComponent)
+                else {
+                    sessionCache.removeValue(forKey: file)
                     continue
                 }
-                loaded.append(session)
+                sessionCache[file] = (modDate: modDate, session: decoded)
+                session = decoded
+            }
+            if let other = loaded[session.sessionId], other.activityTs >= session.activityTs {
                 continue
             }
-
-            // File is new or changed — read, parse, cache
-            guard let data = try? Data(contentsOf: file),
-                  let session = try? decoder.decode(Session.self, from: data) else {
-                sessionCache.removeValue(forKey: file)
-                continue
-            }
-
-            sessionCache[file] = (modDate: modDate, session: session)
-
-            // Skip stale sessions (finer-grained per-status threshold)
-            if let updated = session.lastUpdatedDate,
-               now.timeIntervalSince(updated) > staleThreshold(for: session) {
-                continue
-            }
-
-            loaded.append(session)
+            loaded[session.sessionId] = session
         }
 
-        // Evict cache entries for deleted files
+        // Evict cache entries for deleted files.
         if sessionCache.count > currentFiles.count + 10 {
             sessionCache = sessionCache.filter { currentFiles.contains($0.key) }
         }
+        hookSessions = Array(loaded.values)
+        readUsage()
+    }
 
-        // Override stale PERMISSION → WAITING (handles ExitPlanMode
-        // dismissed via Esc or "keep planning" without Stop event)
-        for i in loaded.indices {
-            guard loaded[i].parsedStatus == .permission,
-                  let updated = loaded[i].lastUpdatedDate,
-                  now.timeIntervalSince(updated) > Self.permissionOverrideInterval
-            else { continue }
-            loaded[i].status = SessionStatus.waiting.rawValue
+    private func readUsage() {
+        guard let modDate = (try? usageURL.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate,
+              modDate != usageModDate else { return }
+        usageModDate = modDate
+        if let data = try? Data(contentsOf: usageURL),
+           let decoded = try? JSONDecoder().decode(UsageResponse.self, from: data),
+           decoded != usage {
+            usage = decoded
+        }
+    }
+
+    // MARK: - Rows
+
+    /// Merge hook state with the latest live snapshot into display rows.
+    private func recompute() {
+        let now = Date().timeIntervalSince1970
+        let observedAt = snapshot?.observedAt
+        let entries = snapshot?.entries ?? [:]
+
+        var built: [DisplayRow] = []
+        var tracked = Set<String>()
+        for session in hookSessions {
+            tracked.insert(session.sessionId)
+            let entry = entries[session.sessionId]
+            let effective = Merge.effective(hook: session, live: entry, observedAt: observedAt, now: now)
+            built.append(DisplayRow(session: session, live: entry, effective: effective))
+        }
+        for (sessionId, entry) in entries where !tracked.contains(sessionId) {
+            let effective = Merge.effective(hook: nil, live: entry, observedAt: observedAt, now: now)
+            built.append(DisplayRow(session: nil, live: entry, effective: effective))
+        }
+        built.removeAll { row in
+            row.effective.hidden
+                || (row.effective.staleIdle && !showAll)
+                || Self.hiddenProjects.contains(row.project)
+        }
+        built.sort(by: DisplayRow.displayOrder)
+
+        if transitionsArmed {
+            detectTransitions(built)
+        }
+        previousStatuses = Dictionary(built.map { ($0.id, $0.status) }, uniquingKeysWith: { first, _ in first })
+        if hasPolledOnce {
+            transitionsArmed = true  // the first poll's statuses are the baseline
         }
 
-        // Hide ClaudeProbe sessions
-        loaded.removeAll { $0.project == "ClaudeProbe" }
-
-        // Sort: active first, then by lastUpdated descending
-        loaded.sort { a, b in
-            if a.isActive != b.isActive { return a.isActive }
-            return a.lastUpdated > b.lastUpdated
+        // Only mutate observed state when something changed (no needless redraws).
+        if built != rows {
+            rows = built
         }
 
-        // Detect transitions (skip on first load to avoid false positives)
-        if didInitialLoad {
-            detectTransitions(newSessions: loaded)
-        }
-
-        // Update previous states
-        var newStates: [String: String] = [:]
-        for session in loaded {
-            newStates[session.sessionId] = session.status
-        }
-        previousStates = newStates
-        didInitialLoad = true
-
-        // Only mutate @Observable properties if data actually changed.
-        // This prevents unnecessary SwiftUI view invalidation.
-        if loaded.count != sessions.count || loaded != sessions {
-            sessions = loaded
-        }
-
-        // Always re-match IDEs: even when sessions are unchanged, an IDE process
-        // may have launched or crashed without its lock file being updated.
-        // The equality guard inside matchSessionsToIdes() prevents spurious SwiftUI writes.
+        // Always re-match IDEs: an IDE may have launched or quit without its
+        // lock file changing. The equality guard inside avoids spurious writes.
         matchSessionsToIdes()
+    }
 
-        // Read usage data (only when file has changed)
-        if let modDate = (try? usageURL.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate,
-           modDate != usageModDate {
-            usageModDate = modDate
-            if let data = try? Data(contentsOf: usageURL),
-               let decoded = try? JSONDecoder().decode(UsageResponse.self, from: data) {
-                if decoded != usage {
-                    usage = decoded
+    private func detectTransitions(_ newRows: [DisplayRow]) {
+        var waiting = waitingSessions
+        var present = Set<String>()
+        for row in newRows {
+            present.insert(row.id)
+            let previous = previousStatuses[row.id]
+            let status = row.status
+
+            // Entering PERMISSION -> dock bounce; leaving it -> cancel the bounce.
+            if status == .permission && previous != .permission {
+                if let requestId = NSApp?.requestUserAttention(.criticalRequest) {
+                    attentionRequests[row.id] = requestId
                 }
-            }
-        }
-
-    }
-
-    // MARK: - Process Discovery
-
-    private func refreshProcessMappings() {
-        let newMapping = ProcessDiscovery.pidsBySession(for: sessions)
-        if newMapping != pidsBySessionId {
-            pidsBySessionId = newMapping
-        }
-    }
-
-    func killProcess(pid: pid_t, force: Bool) {
-        kill(pid, force ? SIGKILL : SIGTERM)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-            self?.refreshProcessMappings()
-        }
-    }
-
-    private func detectTransitions(newSessions: [Session]) {
-        for session in newSessions {
-            let prev = previousStates[session.sessionId]
-
-            // PERMISSION transition -> dock bounce + store request ID
-            if session.status == SessionStatus.permission.rawValue && prev != SessionStatus.permission.rawValue {
-                let requestId = NSApp?.requestUserAttention(.criticalRequest) ?? 0
-                attentionRequests[session.sessionId] = requestId
+            } else if status != .permission, let requestId = attentionRequests.removeValue(forKey: row.id) {
+                NSApp?.cancelUserAttentionRequest(requestId)
             }
 
-            // Exit PERMISSION -> cancel bounce
-            if prev == SessionStatus.permission.rawValue && session.status != SessionStatus.permission.rawValue {
-                if let requestId = attentionRequests.removeValue(forKey: session.sessionId) {
-                    NSApp?.cancelUserAttentionRequest(requestId)
+            // A turn finished (WAITING after real work) -> badge + highlight;
+            // not on first appearance and not from STARTING.
+            if status == .waiting {
+                if let previous, Self.badgeSources.contains(previous) {
+                    waiting.insert(row.id)
                 }
-            }
-
-            // WAITING transition -> increment badge + highlight row
-            if session.status == SessionStatus.waiting.rawValue && prev != SessionStatus.waiting.rawValue {
-                waitingCount += 1
-                waitingSessions.insert(session.sessionId)
-                updateBadge()
-            }
-
-            // Exit WAITING -> decrement badge + remove highlight
-            if prev == SessionStatus.waiting.rawValue && session.status != SessionStatus.waiting.rawValue {
-                waitingCount = max(0, waitingCount - 1)
-                waitingSessions.remove(session.sessionId)
-                updateBadge()
+            } else {
+                waiting.remove(row.id)
             }
         }
 
-        // Clean up attention requests for sessions that disappeared
-        let currentIds = Set(newSessions.map(\.sessionId))
-        for (sessionId, requestId) in attentionRequests where !currentIds.contains(sessionId) {
+        // Rows that disappeared no longer need attention.
+        for (sessionId, requestId) in attentionRequests where !present.contains(sessionId) {
             NSApp?.cancelUserAttentionRequest(requestId)
             attentionRequests.removeValue(forKey: sessionId)
+        }
+        waiting.formIntersection(present)
+
+        if waiting != waitingSessions {
+            waitingSessions = waiting
+            updateBadge()
+        }
+    }
+
+    // MARK: - Live polling
+
+    /// 5 s while something is active or the app is frontmost, else 30 s.
+    private var pollInterval: TimeInterval {
+        let frontmost = NSApp?.isActive ?? false
+        let anyActive = rows.contains { $0.status.isActive }
+        return frontmost || anyActive ? Self.activePollInterval : Self.idlePollInterval
+    }
+
+    /// Start a poll unless one is in flight (never more than one).
+    private func startPoll() {
+        guard pollTask == nil else { return }
+        cancelScheduledPoll()
+        lastPollStarted = .now
+        let live = self.live
+        pollTask = Task { [weak self] in
+            let snapshot = await live.poll()  // runs off the main actor
+            self?.finishPoll(snapshot)
+        }
+    }
+
+    private func finishPoll(_ snapshot: LiveSnapshot?) {
+        pollTask = nil
+        lastPollFailed = snapshot == nil
+        if let snapshot {
+            self.snapshot = snapshot
+            if liveSource != snapshot.source {
+                liveSource = snapshot.source
+            }
+        }
+        if !hasPolledOnce {
+            hasPolledOnce = true
+        }
+        loadHookFiles()  // also a safety net for missed directory events
+        recompute()
+        schedulePoll(after: pollInterval)
+    }
+
+    /// Poll after `delay` unless a poll is already scheduled sooner.
+    private func schedulePoll(after delay: TimeInterval) {
+        let delay = max(0, delay)
+        let due = Date.now.addingTimeInterval(delay)
+        if nextPollTask != nil && nextPollDue <= due { return }
+        nextPollTask?.cancel()
+        nextPollDue = due
+        nextPollTask = Task { [weak self] in
+            if delay > 0 {
+                try? await Task.sleep(for: .seconds(delay))
+            }
+            guard !Task.isCancelled, let self else { return }
+            self.nextPollTask = nil
+            self.nextPollDue = .distantFuture
+            self.startPoll()  // if one is in flight, its completion schedules the next
+        }
+    }
+
+    private func cancelScheduledPoll() {
+        nextPollTask?.cancel()
+        nextPollTask = nil
+        nextPollDue = .distantFuture
+    }
+
+    /// Throttled "poll soon" (directory changes, app activation).
+    private func kickPoll() {
+        schedulePoll(after: Self.kickMinInterval - Date.now.timeIntervalSince(lastPollStarted))
+    }
+
+    /// A snapshot taken after this call (waits for any poll in flight, then
+    /// polls); nil if that poll failed.
+    private func pollNow() async -> LiveSnapshot? {
+        while let inFlight = pollTask {
+            await inFlight.value
+        }
+        startPoll()
+        if let task = pollTask {
+            await task.value
+        }
+        return lastPollFailed ? nil : snapshot
+    }
+
+    // MARK: - Actions
+
+    /// The shell command that resumes a session.
+    func resumeCommand(for sessionId: String) -> String {
+        "claude --resume \(sessionId)"
+    }
+
+    /// Stop (`claude stop` for a background session), terminate (SIGTERM) or
+    /// force-kill (SIGKILL) the session's process. A fresh poll must still
+    /// list the session with the same pid (and job), else nothing is sent.
+    func stop(sessionId: String, expected: LiveEntry, force: Bool) {
+        Task { [weak self] in
+            guard let self else { return }
+            let snapshot = await self.pollNow()
+            guard let current = snapshot?.entries[sessionId],
+                  current.pid == expected.pid,
+                  current.jobId == expected.jobId else {
+                log.notice("Not stopping \(sessionId, privacy: .public): its live entry changed")
+                NSSound.beep()
+                return
+            }
+            let result = await self.live.stop(entry: current, force: force)
+            if case .failed(let message) = result {
+                log.error("Stopping \(sessionId, privacy: .public) failed: \(message, privacy: .public)")
+                NSSound.beep()
+            }
+            // Re-poll once the process had a moment to exit.
+            try? await Task.sleep(for: .seconds(1))
+            self.schedulePoll(after: 0)
         }
     }
 
@@ -370,14 +525,15 @@ final class SessionStore {
         // Cache icons by bundle path to avoid repeated NSWorkspace.icon(forFile:) disk reads
         var iconCache: [String: NSImage] = [:]
 
-        for session in sessions {
-            guard !session.cwd.isEmpty else { continue }
+        for row in rows {
+            let cwd = row.cwd
+            guard !cwd.isEmpty else { continue }
 
-            // Find all lock file entries whose workspace folder is a prefix of session.cwd
+            // Find all lock file entries whose workspace folder is a prefix of the cwd
             var candidates: [(lockFile: IdeLockFile, modDate: Date, folder: String, isRunning: Bool)] = []
             for entry in ideLockEntries {
                 for folder in entry.lockFile.workspaceFolders {
-                    if session.cwd == folder || session.cwd.hasPrefix(folder + "/") {
+                    if cwd == folder || cwd.hasPrefix(folder + "/") {
                         candidates.append((lockFile: entry.lockFile, modDate: entry.modDate, folder: folder, isRunning: runningApps[entry.lockFile.pid] != nil))
                     }
                 }
@@ -406,7 +562,7 @@ final class SessionStore {
                 icon = NSImage(systemSymbolName: "app.fill", accessibilityDescription: nil) ?? NSImage()
             }
 
-            result[session.sessionId] = IdeInfo(
+            result[row.id] = IdeInfo(
                 ideName: best.lockFile.ideName,
                 pid: best.lockFile.pid,
                 isRunning: best.isRunning,
@@ -444,3 +600,5 @@ final class SessionStore {
         NSWorkspace.shared.open([folderURL], withApplicationAt: bundleURL, configuration: config)
     }
 }
+
+private let showAllDefaultsKey = "showIdleSessions"

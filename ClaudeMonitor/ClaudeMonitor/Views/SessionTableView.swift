@@ -3,14 +3,58 @@ import SwiftUI
 // MARK: - Row Item
 
 enum RowItem: Identifiable {
-    case session(Session)
-    case subagent(Subagent)
+    case session(DisplayRow)
+    /// A subagent of the session `parentId`; `waiting` = it waits on a prompt.
+    case subagent(parentId: String, agent: Subagent, waiting: Bool)
+    /// "+N more" subagents beyond the ones listed.
+    case more(parentId: String, count: Int)
 
     var id: String {
         switch self {
-        case .session(let s): s.id
-        case .subagent(let a): a.id
+        case .session(let row): row.id
+        case .subagent(let parentId, let agent, _): "\(parentId)/\(agent.agentId)"
+        case .more(let parentId, _): "\(parentId)/+more"
         }
+    }
+
+    /// The session this row belongs to.
+    var sessionId: String {
+        switch self {
+        case .session(let row): row.id
+        case .subagent(let parentId, _, _), .more(let parentId, _): parentId
+        }
+    }
+}
+
+/// A confirmed stop/terminate/kill of one session's process.
+struct StopRequest {
+    let sessionId: String
+    let project: String
+    let entry: LiveEntry
+    let force: Bool
+
+    /// Background sessions are stopped via `claude stop` (killed workers respawn).
+    var usesClaudeStop: Bool {
+        entry.kind == .background && !(entry.jobId ?? "").isEmpty && !force
+    }
+
+    var title: String {
+        if usesClaudeStop { return "Stop Background Session?" }
+        return force ? "Force Kill Process?" : "Terminate Process?"
+    }
+
+    var message: String {
+        if usesClaudeStop {
+            let pid = entry.pid.map { ", PID \($0)" } ?? ""
+            return "\(project): claude stop \(entry.jobId ?? "")\(pid)"
+        }
+        let pid = entry.pid.map(String.init) ?? "?"
+        return "\(project): PID \(pid) — \(force ? "SIGKILL (force)" : "SIGTERM (graceful)")"
+    }
+
+    var confirmLabel: String {
+        if usesClaudeStop { return "Stop" }
+        return force ? "Force Kill" : "Terminate"
     }
 }
 
@@ -18,163 +62,288 @@ enum RowItem: Identifiable {
 
 struct SessionTableView: View {
     @Environment(SessionStore.self) private var store
-    @State private var killTarget: (pid: pid_t, force: Bool)?
+    @State private var stopRequest: StopRequest?
 
-    private var rows: [RowItem] {
+    /// Subagent rows listed per session before "+N more".
+    private static let subagentRowLimit = 8
+
+    private var items: [RowItem] {
         var items: [RowItem] = []
-        for session in store.sessions {
-            items.append(.session(session))
-            // Only show subagents for active sessions (not WAITING/ENDED)
-            if session.parsedStatus != .waiting && session.parsedStatus != .ended {
-                for agent in session.subagents {
-                    items.append(.subagent(agent))
-                }
+        for row in store.rows {
+            items.append(.session(row))
+            guard let session = row.session else { continue }
+            // Subagents are listed whatever the session's status.
+            let shown = session.subagents.prefix(Self.subagentRowLimit)
+            for agent in shown {
+                let waiting = agent.parsedStatus == .permission || session.pending[agent.agentId] != nil
+                items.append(.subagent(parentId: row.id, agent: agent, waiting: waiting))
+            }
+            let extra = session.subagents.count - shown.count + session.subagentsOverflow
+            if extra > 0 {
+                items.append(.more(parentId: row.id, count: extra))
             }
         }
         return items
     }
 
     var body: some View {
+        let items = self.items
         VStack(spacing: 0) {
-            if store.sessions.isEmpty {
+            if store.rows.isEmpty {
                 ContentUnavailableView(
                     "No Sessions",
                     systemImage: "terminal",
-                    description: Text("Waiting for Claude sessions...")
+                    description: Text(store.showAll
+                        ? "Waiting for Claude sessions..."
+                        : "Waiting for Claude sessions... (idle sessions are hidden)")
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                Table(rows) {
-                    TableColumn("Status") { row in
-                        cell(for: row, alignment: .center) { statusCell(for: row) }
-                    }
-                    .width(min: 85, ideal: 95, max: 110)
+                Table(items) {
+                    Group {
+                        TableColumn("Status") { item in
+                            cell(for: item, alignment: .center, dimsUntracked: false) { statusCell(for: item) }
+                        }
+                        .width(min: 85, ideal: 100, max: 180)
 
-                    TableColumn("IDE") { row in
-                        cell(for: row, alignment: .center) { ideCell(for: row) }
-                    }
-                    .width(min: 30, ideal: 35, max: 40)
+                        TableColumn("IDE") { item in
+                            cell(for: item, alignment: .center) { ideCell(for: item) }
+                        }
+                        .width(min: 30, ideal: 35, max: 40)
 
-                    TableColumn("Project") { row in
-                        cell(for: row) { projectCell(for: row) }
-                    }
-                    .width(min: 70, ideal: 120, max: 200)
+                        TableColumn("Project") { item in
+                            cell(for: item) { projectCell(for: item) }
+                        }
+                        .width(min: 70, ideal: 130, max: 220)
 
-                    TableColumn("Tool") { row in
-                        cell(for: row) { toolCell(for: row) }
-                    }
-                    .width(min: 50, ideal: 90, max: 160)
+                        TableColumn("Tool") { item in
+                            cell(for: item) { toolCell(for: item) }
+                        }
+                        .width(min: 50, ideal: 90, max: 180)
 
-                    TableColumn("Model") { row in
-                        cell(for: row, alignment: .center) { modelCell(for: row) }
+                        TableColumn("Model") { item in
+                            cell(for: item, alignment: .center) { modelCell(for: item) }
+                        }
+                        .width(min: 50, ideal: 95, max: 140)
                     }
-                    .width(min: 45, ideal: 50, max: 60)
+                    Group {
+                        TableColumn("Mode") { item in
+                            cell(for: item, alignment: .center) { modeCell(for: item) }
+                        }
+                        .width(min: 38, ideal: 52, max: 70)
 
-                    TableColumn("Mode") { row in
-                        cell(for: row, alignment: .center) { modeCell(for: row) }
-                    }
-                    .width(min: 38, ideal: 45, max: 55)
+                        TableColumn("Ctx") { item in
+                            cell(for: item, alignment: .center) { contextCell(for: item) }
+                        }
+                        .width(min: 35, ideal: 45, max: 60)
 
-                    TableColumn("Tools") { row in
-                        cell(for: row, alignment: .center) { toolCountCell(for: row) }
-                    }
-                    .width(min: 35, ideal: 40, max: 50)
+                        TableColumn("Tools") { item in
+                            cell(for: item, alignment: .center) { toolCountCell(for: item) }
+                        }
+                        .width(min: 35, ideal: 45, max: 55)
 
-                    TableColumn("Duration") { row in
-                        cell(for: row, alignment: .center) { durationCell(for: row) }
-                    }
-                    .width(min: 55, ideal: 65, max: 80)
+                        TableColumn("Duration") { item in
+                            cell(for: item, alignment: .center) { durationCell(for: item) }
+                        }
+                        .width(min: 55, ideal: 65, max: 80)
 
-                    TableColumn("Updated") { row in
-                        cell(for: row, alignment: .center) { updatedCell(for: row) }
-                    }
-                    .width(min: 50, ideal: 60, max: 75)
+                        TableColumn("Updated") { item in
+                            cell(for: item, alignment: .center) { updatedCell(for: item) }
+                        }
+                        .width(min: 50, ideal: 70, max: 90)
 
-                    TableColumn("Topic") { row in
-                        cell(for: row) { topicCell(for: row) }
+                        TableColumn("Topic") { item in
+                            cell(for: item) { topicCell(for: item) }
+                        }
+                        .width(min: 150, ideal: 380)
                     }
-                    .width(min: 150, ideal: 400)
                 }
                 .background(
                     TableViewConfigurator(
-                        rows: rows,
-                        onSessionDoubleClick: { sessionId in
+                        rows: items,
+                        onRowDoubleClick: { sessionId in
                             store.activateIdeWindow(for: sessionId)
                         }
                     )
                 )
+            }
 
-                StatusBarView()
+            StatusBarView()
+        }
+        .frame(minWidth: 900, minHeight: 400)
+        .navigationTitle("Claude Monitor")
+        .toolbar {
+            ToolbarItem {
+                Toggle(isOn: Binding(get: { store.showAll }, set: { store.showAll = $0 })) {
+                    Label("Show idle", systemImage: "moon.zzz")
+                }
+                .toggleStyle(.button)
+                .labelStyle(.titleAndIcon)
+                .help("Also show sessions idle for more than 4 hours")
             }
         }
-        .frame(minWidth: 800, minHeight: 400)
-        .navigationTitle("Claude Monitor")
-        .alert("Kill Process?", isPresented: Binding(get: { killTarget != nil }, set: { if !$0 { killTarget = nil } })) {
+        .alert(
+            stopRequest?.title ?? "",
+            isPresented: Binding(get: { stopRequest != nil }, set: { if !$0 { stopRequest = nil } }),
+            presenting: stopRequest
+        ) { request in
             Button("Cancel", role: .cancel) { }
-            Button(killTarget?.force == true ? "Force Kill" : "Terminate", role: .destructive) {
-                if let target = killTarget {
-                    store.killProcess(pid: target.pid, force: target.force)
-                }
+            Button(request.confirmLabel, role: .destructive) {
+                store.stop(sessionId: request.sessionId, expected: request.entry, force: request.force)
             }
-        } message: {
-            if let target = killTarget {
-                Text("PID \(target.pid) — \(target.force ? "SIGKILL (force)" : "SIGTERM (graceful)")")
-            }
+        } message: { request in
+            Text(request.message)
         }
     }
 
-    // MARK: - Row Background
+    // MARK: - Cell Chrome
 
-    private func rowBackgroundColor(for row: RowItem) -> Color? {
-        if case .session(let s) = row, store.waitingSessions.contains(s.sessionId) {
+    private func rowBackgroundColor(for item: RowItem) -> Color? {
+        if case .session(let row) = item, store.waitingSessions.contains(row.id) {
             return .red
         }
         return nil
     }
 
     @ViewBuilder
-    private func cell(for row: RowItem, alignment: Alignment = .leading, @ViewBuilder content: () -> some View) -> some View {
+    private func cell(
+        for item: RowItem,
+        alignment: Alignment = .leading,
+        dimsUntracked: Bool = true,
+        @ViewBuilder content: () -> some View
+    ) -> some View {
         content()
+            .opacity(dimsUntracked && isUntracked(item) ? 0.55 : 1)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: alignment)
-            .background(rowBackgroundColor(for: row)?.opacity(0.15) ?? .clear)
+            .background(rowBackgroundColor(for: item)?.opacity(0.15) ?? .clear)
             .contentShape(Rectangle())
-            .contextMenu { sessionContextMenu(for: row) }
+            .contextMenu { contextMenu(for: item) }
     }
 
+    private func isUntracked(_ item: RowItem) -> Bool {
+        if case .session(let row) = item { return row.effective.untracked }
+        return false
+    }
+
+    // MARK: - Context Menu
+
     @ViewBuilder
-    private func sessionContextMenu(for row: RowItem) -> some View {
-        if case .session(let session) = row {
+    private func contextMenu(for item: RowItem) -> some View {
+        if case .session(let row) = item {
             Button("Copy Session ID") {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(session.sessionId, forType: .string)
+                copyToPasteboard(row.id)
+            }
+            Button("Copy Resume Command") {
+                copyToPasteboard(store.resumeCommand(for: row.id))
             }
 
             Divider()
 
-            if let pids = store.pidsBySessionId[session.sessionId], !pids.isEmpty {
-                ForEach(pids, id: \.self) { pid in
-                    Section("PID \(pid)") {
-                        Button("Terminate (SIGTERM)") {
-                            killTarget = (pid, false)
-                        }
-                        Button("Force Kill (SIGKILL)") {
-                            killTarget = (pid, true)
+            Section(processTitle(for: row)) {
+                if let entry = row.live, entry.kind == .background, let jobId = entry.jobId, !jobId.isEmpty {
+                    Button("Stop (claude stop \(jobId))") {
+                        stopRequest = StopRequest(sessionId: row.id, project: row.project, entry: entry, force: false)
+                    }
+                } else {
+                    Button("Terminate (SIGTERM)") {
+                        if let entry = row.live {
+                            stopRequest = StopRequest(sessionId: row.id, project: row.project, entry: entry, force: false)
                         }
                     }
+                    .disabled(row.pid == nil)
                 }
-            } else {
-                Text("No process found")
+                Button("Force Kill (SIGKILL)") {
+                    if let entry = row.live {
+                        stopRequest = StopRequest(sessionId: row.id, project: row.project, entry: entry, force: true)
+                    }
+                }
+                .disabled(row.pid == nil)
             }
         }
+    }
+
+    private func processTitle(for row: DisplayRow) -> String {
+        if let pid = row.pid { return "PID \(pid)" }
+        if let jobId = row.live?.jobId, !jobId.isEmpty { return "Background job \(jobId)" }
+        return "No live process"
+    }
+
+    private func copyToPasteboard(_ text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
     }
 
     // MARK: - Cell Views
 
     @ViewBuilder
-    private func ideCell(for row: RowItem) -> some View {
-        switch row {
-        case .session(let session):
-            if let ide = store.ideInfoBySessionId[session.sessionId] {
+    private func statusCell(for item: RowItem) -> some View {
+        switch item {
+        case .session(let row):
+            HStack(spacing: 4) {
+                statusBadge(for: row.status)
+                if let error = row.session?.lastError, !error.isEmpty {
+                    Text("⚠ \(error)")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.red)
+                        .lineLimit(1)
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 1)
+                        .background(Color.red.opacity(0.12))
+                        .clipShape(Capsule())
+                        .help("The last turn ended with an API error: \(error)")
+                }
+            }
+            .help(statusTooltip(for: row))
+        case .subagent(_, _, let waiting):
+            HStack(spacing: 4) {
+                Image(systemName: "arrow.turn.down.right")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                statusBadge(for: waiting ? .permission : .executing, label: waiting ? "PERMISSION" : "RUNNING")
+            }
+        case .more:
+            Text("")
+        }
+    }
+
+    private func statusTooltip(for row: DisplayRow) -> String {
+        var lines: [String] = []
+        if let detail = row.effective.detail ?? row.live?.waitingFor, !detail.isEmpty {
+            lines.append("Waiting for: \(detail)")
+        }
+        if let session = row.session, !session.pending.isEmpty {
+            for (agent, prompt) in session.pending.sorted(by: { $0.key < $1.key }) {
+                let who = agent == "main"
+                    ? "main agent"
+                    : (session.subagents.first { $0.agentId == agent }?.agentType ?? "subagent")
+                lines.append("Prompt (\(who)): \(prompt.tool.isEmpty ? "?" : prompt.tool)")
+            }
+        }
+        if let live = row.live {
+            if live.kind == .background {
+                lines.append("Background job \(live.jobId ?? "?")\(live.state.map { ": \($0)" } ?? "")")
+            }
+            if let status = live.status {
+                lines.append("Claude Code: \(status)")
+            }
+        }
+        if row.effective.legacy {
+            lines.append("Live status unavailable: hook data only")
+        }
+        if row.effective.untracked {
+            lines.append("No hook data for this session")
+        }
+        if let error = row.session?.lastError, !error.isEmpty {
+            lines.append("Last error: \(error)")
+        }
+        return lines.isEmpty ? row.status.label : lines.joined(separator: "\n")
+    }
+
+    @ViewBuilder
+    private func ideCell(for item: RowItem) -> some View {
+        switch item {
+        case .session(let row):
+            if let ide = store.ideInfoBySessionId[row.id] {
                 Image(nsImage: ide.appIcon)
                     .resizable()
                     .frame(width: 16, height: 16)
@@ -188,145 +357,235 @@ struct SessionTableView: View {
                     .foregroundStyle(.tertiary)
                     .help("Terminal")
             }
-        case .subagent:
+        case .subagent, .more:
             Text("")
         }
     }
 
     @ViewBuilder
-    private func statusCell(for row: RowItem) -> some View {
-        switch row {
-        case .session(let session):
-            statusBadge(for: session.parsedStatus)
-        case .subagent(let agent):
+    private func projectCell(for item: RowItem) -> some View {
+        switch item {
+        case .session(let row):
             HStack(spacing: 4) {
-                Image(systemName: "arrow.turn.down.right")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-                statusBadge(for: agent.parsedStatus)
+                Text(row.project)
+                    .fontWeight(.medium)
+                    .lineLimit(1)
+                if row.effective.untracked {
+                    Text("untracked")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 1)
+                        .background(Color.secondary.opacity(0.18))
+                        .clipShape(Capsule())
+                }
             }
-        }
-    }
-
-    @ViewBuilder
-    private func projectCell(for row: RowItem) -> some View {
-        switch row {
-        case .session(let session):
-            Text(session.project)
-                .fontWeight(.medium)
-                .lineLimit(1)
-        case .subagent(let agent):
-            Text(agent.agentType)
+            .help(projectTooltip(for: row))
+        case .subagent(_, let agent, _):
+            Text(agent.agentType.isEmpty ? String(agent.agentId.prefix(12)) : agent.agentType)
                 .font(.caption)
                 .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .padding(.leading, 16)
+                .help(agent.description.isEmpty ? agent.agentId : "\(agent.description)\n\(agent.agentId)")
+        case .more(_, let count):
+            Text("+\(count) more")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
                 .padding(.leading, 16)
         }
     }
 
+    private func projectTooltip(for row: DisplayRow) -> String {
+        var lines: [String] = []
+        if let name = row.live?.name, !name.isEmpty {
+            lines.append(name)
+        }
+        if !row.cwd.isEmpty {
+            lines.append(row.cwd)
+        }
+        if row.effective.untracked {
+            lines.append("Untracked: live session without hook data")
+        }
+        return lines.isEmpty ? row.project : lines.joined(separator: "\n")
+    }
+
     @ViewBuilder
-    private func toolCell(for row: RowItem) -> some View {
-        switch row {
-        case .session(let session):
-            Text(session.toolName ?? "-")
+    private func toolCell(for item: RowItem) -> some View {
+        switch item {
+        case .session(let row):
+            Text(toolText(for: row))
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
-        case .subagent:
-            Text("")
-        }
-    }
-
-    @ViewBuilder
-    private func modelCell(for row: RowItem) -> some View {
-        switch row {
-        case .session(let session):
-            HStack(spacing: 2) {
-                Text(session.shortModel)
-                if session.hasLargeContext {
-                    Text("1M")
-                        .font(.system(size: 7, weight: .bold))
-                        .padding(.horizontal, 2)
-                        .padding(.vertical, 0.5)
-                        .background(Color.secondary.opacity(0.25))
-                        .clipShape(Capsule())
-                }
-            }
-            .foregroundStyle(.secondary)
-            .help(session.model)
-        case .subagent:
-            Text("")
-        }
-    }
-
-    @ViewBuilder
-    private func modeCell(for row: RowItem) -> some View {
-        switch row {
-        case .session(let session):
-            Text(session.shortMode)
+        case .subagent(_, let agent, _):
+            Text(agent.toolName ?? "-")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-        case .subagent:
+                .lineLimit(1)
+        case .more:
             Text("")
         }
     }
 
+    /// What the session is on: the prompt it waits on, its background work, or its tool.
+    private func toolText(for row: DisplayRow) -> String {
+        guard let session = row.session else {
+            return row.effective.detail ?? "-"
+        }
+        switch row.status {
+        case .permission:
+            let pendingTool = session.pending.sorted { $0.key < $1.key }.first { !$0.value.tool.isEmpty }?.value.tool
+            return row.effective.detail ?? pendingTool ?? session.toolName ?? "-"
+        case .background:
+            return "\(session.background.active) in background"
+        default:
+            return session.toolName ?? "-"
+        }
+    }
+
     @ViewBuilder
-    private func toolCountCell(for row: RowItem) -> some View {
-        switch row {
-        case .session(let session):
-            HStack(spacing: 2) {
-                Image(systemName: "wrench.fill")
-                    .font(.caption2)
-                Text("\(session.toolCount)")
+    private func modelCell(for item: RowItem) -> some View {
+        switch item {
+        case .session(let row):
+            if let session = row.session {
+                Text(modelText(for: session))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .help(session.model.isEmpty ? "Model unknown" : session.model)
+            } else {
+                Text("-").foregroundStyle(.secondary)
             }
-            .foregroundStyle(.secondary)
-        case .subagent:
+        case .subagent, .more:
+            Text("")
+        }
+    }
+
+    /// "opus 5.5 · max"
+    private func modelText(for session: Session) -> String {
+        let model = Labels.shortModel(session.model)
+        guard !session.effort.isEmpty else { return model }
+        return session.model.isEmpty ? session.effort : "\(model) · \(session.effort)"
+    }
+
+    @ViewBuilder
+    private func modeCell(for item: RowItem) -> some View {
+        switch item {
+        case .session(let row):
+            Text(Labels.shortMode(row.session?.permissionMode ?? ""))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .help(row.session?.permissionMode ?? "")
+        case .subagent, .more:
             Text("")
         }
     }
 
     @ViewBuilder
-    private func durationCell(for row: RowItem) -> some View {
-        switch row {
-        case .session(let session):
-            Text(session.formattedDuration)
+    private func contextCell(for item: RowItem) -> some View {
+        switch item {
+        case .session(let row):
+            let tokens = row.session?.contextTokens ?? 0
+            Text(Labels.formatTokens(tokens))
                 .monospacedDigit()
                 .foregroundStyle(.secondary)
-        case .subagent:
+                .help(tokens > 0 ? "\(tokens.formatted()) tokens in context" : "Context size unknown")
+        case .subagent, .more:
             Text("")
         }
     }
 
     @ViewBuilder
-    private func updatedCell(for row: RowItem) -> some View {
-        switch row {
-        case .session(let session):
-            Text(session.formattedLastUpdated)
+    private func toolCountCell(for item: RowItem) -> some View {
+        switch item {
+        case .session(let row):
+            if let session = row.session {
+                HStack(spacing: 2) {
+                    Image(systemName: "wrench.fill")
+                        .font(.caption2)
+                    Text("\(session.toolCount)")
+                }
+                .foregroundStyle(.secondary)
+            } else {
+                Text("-").foregroundStyle(.secondary)
+            }
+        case .subagent(_, let agent, _):
+            Text(agent.toolCount > 0 ? "\(agent.toolCount)" : "-")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        case .more:
+            Text("")
+        }
+    }
+
+    @ViewBuilder
+    private func durationCell(for item: RowItem) -> some View {
+        switch item {
+        case .session(let row):
+            Text(formattedDuration(since: row.startDate))
                 .monospacedDigit()
                 .foregroundStyle(.secondary)
-        case .subagent:
+        case .subagent, .more:
             Text("")
         }
     }
 
     @ViewBuilder
-    private func topicCell(for row: RowItem) -> some View {
-        switch row {
-        case .session(let session):
-            Text(session.displayTopic)
+    private func updatedCell(for item: RowItem) -> some View {
+        switch item {
+        case .session(let row):
+            Text(formattedRelative(row.session?.activityDate))
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+        case .subagent(_, let agent, _):
+            Text(formattedRelative(agent.ts > 0 ? Date(timeIntervalSince1970: agent.ts) : nil))
+                .font(.caption)
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+        case .more:
+            Text("")
+        }
+    }
+
+    @ViewBuilder
+    private func topicCell(for item: RowItem) -> some View {
+        switch item {
+        case .session(let row):
+            if let session = row.session {
+                Text(session.displayTopic)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .help(topicTooltip(for: session))
+            } else {
+                let name = row.live?.name ?? ""
+                Text(name.isEmpty ? "untracked" : "untracked · \(name)")
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+        case .subagent(_, let agent, _):
+            Text(agent.description)
+                .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .truncationMode(.tail)
-                .help(session.topic.isEmpty ? session.displayTopic : session.topic)
-        case .subagent:
+                .help(agent.description)
+        case .more:
             Text("")
         }
     }
 
-    private func statusBadge(for status: SessionStatus) -> some View {
+    private func topicTooltip(for session: Session) -> String {
+        if session.title.isEmpty || session.topic.isEmpty || session.title == session.topic {
+            return session.topic.isEmpty ? session.displayTopic : session.topic
+        }
+        return "\(session.title)\n\n\(session.topic)"
+    }
+
+    private func statusBadge(for status: SessionStatus, label: String? = nil) -> some View {
         HStack(spacing: 4) {
             Image(systemName: status.icon)
                 .font(.caption)
-            Text(status.label)
+            Text(label ?? status.label)
                 .font(.caption)
                 .fontWeight(.semibold)
         }
@@ -345,8 +604,9 @@ private struct StatusBarView: View {
 
     var body: some View {
         HStack(spacing: 16) {
+            let counts = store.statusCounts
             ForEach(SessionStatus.allCases, id: \.self) { status in
-                if let count = store.statusCounts[status], count > 0 {
+                if let count = counts[status], count > 0 {
                     HStack(spacing: 4) {
                         Circle()
                             .fill(status.color)
@@ -355,6 +615,18 @@ private struct StatusBarView: View {
                             .font(.caption)
                     }
                 }
+            }
+
+            if store.isLiveOff {
+                Label("live off", systemImage: "antenna.radiowaves.left.and.right.slash")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .help("No fresh live data from `claude agents --json` or the session registry: statuses come from hooks only and may lag (e.g. after Esc).")
+            } else if store.liveSource == .registry {
+                Text("live: registry")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .help("`claude agents --json` is unavailable: live data comes from Claude Code's session registry.")
             }
 
             Spacer()
@@ -378,7 +650,7 @@ private struct UsageBarView: View {
         HStack(spacing: 12) {
             if let limits = usage.limits, !limits.isEmpty {
                 // Modern canonical source: one label per limit, binding one bold.
-                ForEach(limits) { limit in
+                ForEach(Array(limits.enumerated()), id: \.offset) { _, limit in
                     usageLabel(limit.label,
                                percent: limit.percent,
                                reset: limit.formattedResetTime,
@@ -393,7 +665,9 @@ private struct UsageBarView: View {
                     usageLabel("Week", percent: Int(w.utilization), reset: w.formattedResetTime, emphasized: false)
                 }
             }
-            if let extra = usage.extraUsage, extra.isEnabled, let u = extra.utilization {
+            if let spend = usage.spend, spend.enabled == true, let percent = spend.percent {
+                usageLabel("Credits", percent: percent, reset: nil, emphasized: false)
+            } else if let extra = usage.extraUsage, extra.isEnabled, let u = extra.utilization {
                 usageLabel("Extra", percent: Int(u), reset: nil, emphasized: false)
             }
         }
@@ -427,7 +701,7 @@ private struct UsageBarView: View {
 
 private struct TableViewConfigurator: NSViewRepresentable {
     let rows: [RowItem]
-    let onSessionDoubleClick: (String) -> Void
+    let onRowDoubleClick: (String) -> Void
 
     func makeNSView(context: Context) -> TableConfigView {
         TableConfigView()
@@ -435,13 +709,13 @@ private struct TableViewConfigurator: NSViewRepresentable {
 
     func updateNSView(_ nsView: TableConfigView, context: Context) {
         nsView.rows = rows
-        nsView.onSessionDoubleClick = onSessionDoubleClick
+        nsView.onRowDoubleClick = onRowDoubleClick
     }
 }
 
 private final class TableConfigView: NSView {
     var rows: [RowItem] = []
-    var onSessionDoubleClick: ((String) -> Void)?
+    var onRowDoubleClick: ((String) -> Void)?
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
@@ -484,9 +758,8 @@ private final class TableConfigView: NSView {
     @objc func tableViewDoubleClick(_ sender: NSTableView) {
         let clickedRow = sender.clickedRow
         guard clickedRow >= 0, clickedRow < rows.count else { return }
-        if case .session(let session) = rows[clickedRow] {
-            onSessionDoubleClick?(session.sessionId)
-        }
+        // Subagent rows open their session's IDE too.
+        onRowDoubleClick?(rows[clickedRow].sessionId)
     }
 }
 

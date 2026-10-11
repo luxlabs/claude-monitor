@@ -1,183 +1,238 @@
 import Foundation
 
-struct Session: Codable, Identifiable, Equatable {
+/// A permission prompt one agent ("main" or a subagent id) is waiting on.
+struct PendingPrompt: Equatable, Sendable {
+    let tool: String
+    let fp: String
+    let since: Double
+}
+
+/// Summary of the session's background tasks (`background` in the file).
+struct BackgroundTasks: Equatable, Sendable {
+    let active: Int
+    let types: [String: Int]
+}
+
+/// One hook-written session file (`~/.claude/monitor/sessions/<id>.json`).
+///
+/// Decodes schema 2 and the legacy schema 1 exactly like
+/// `SessionState.from_dict` in state.py.
+struct Session: Decodable, Identifiable, Equatable, Sendable {
     let sessionId: String
     let cwd: String
     let project: String
-    var status: String
+    /// Main-agent status; PERMISSION is derived from `pending`, not stored here.
+    let baseStatus: SessionStatus
+    /// Last main-status transition (epoch seconds, event clock).
+    let statusTs: Double
+    /// Last event of any kind, main agent or subagent (epoch seconds).
+    let activityTs: Double
     let toolName: String?
     let permissionMode: String
     let model: String
+    let effort: String
+    let contextTokens: Int
     let topic: String
-    let title: String
     let lastPrompt: String
+    let customTitle: String
+    let aiTitle: String
     let toolCount: Int
     let startedAt: String
-    let lastUpdated: String
+    /// Agent key ("main" or a subagent id) -> the prompt it waits on.
+    let pending: [String: PendingPrompt]
+    let lastError: String
+    let background: BackgroundTasks
+    let crons: Int
     let subagents: [Subagent]
+    let subagentsOverflow: Int
 
-    /// Pre-parsed dates — computed once at decode time, not on every access.
-    /// ISO8601DateFormatter is extremely expensive (goes through ICU).
+    /// `startedAt` parsed once at decode time.
     let startDate: Date?
-    let lastUpdatedDate: Date?
 
     var id: String { sessionId }
 
-    var parsedStatus: SessionStatus {
-        SessionStatus(rawValue: status) ?? .ended
+    // MARK: Derived
+
+    /// PERMISSION while any agent waits on a prompt, else the main status.
+    var status: SessionStatus {
+        pending.isEmpty ? baseStatus : .permission
     }
 
-    var duration: TimeInterval? {
-        guard let start = startDate else { return nil }
-        return Date.now.timeIntervalSince(start)
+    /// The user's custom title, else Claude Code's AI title.
+    var title: String {
+        customTitle.isEmpty ? aiTitle : customTitle
     }
 
-    var formattedLastUpdated: String {
-        guard let date = lastUpdatedDate else { return "-" }
-        return RelativeDateTimeFormatter.monitor.localizedString(for: date, relativeTo: Date.now)
+    /// The session title when known, else the latest prompt.
+    var displayTopic: String {
+        title.isEmpty ? topic : title
     }
 
-    var formattedDuration: String {
-        guard let duration else { return "-" }
-        let hours = Int(duration) / 3600
-        let minutes = (Int(duration) % 3600) / 60
-        let seconds = Int(duration) % 60
-        if hours > 0 {
-            return String(format: "%dh %02dm", hours, minutes)
+    var statusDate: Date? {
+        statusTs > 0 ? Date(timeIntervalSince1970: statusTs) : nil
+    }
+
+    var activityDate: Date? {
+        activityTs > 0 ? Date(timeIntervalSince1970: activityTs) : nil
+    }
+
+    // MARK: Decoding
+
+    /// The file's object as in state.py's `from_dict(d, fallback_id)`.
+    init(json d: [String: JSONValue], fallbackId: String = "") {
+        let legacy = d["base_status"] == nil
+        let activity = d["activity_ts"]?.numberValue ?? 0
+        let lastTs = activity != 0 ? activity : Self.isoSeconds(d["last_updated"])
+
+        var pending: [String: PendingPrompt] = [:]
+        for (key, value) in d["pending"]?.objectValue ?? [:] {
+            guard let p = value.objectValue else { continue }
+            pending[key] = PendingPrompt(
+                tool: p["tool"]?.stringValue ?? "",
+                fp: p["fp"]?.stringValue ?? "",
+                since: p["since"]?.numberValue ?? 0
+            )
         }
-        return String(format: "%dm %02ds", minutes, seconds)
-    }
 
-    var shortModel: String {
-        if model.contains("opus") { return "opus" }
-        if model.contains("sonnet") { return "sonnet" }
-        if model.contains("haiku") { return "haiku" }
-        if model.contains("fable") { return "fable" }
-        return model
-    }
-
-    var shortMode: String {
-        switch permissionMode {
-        case "bypassPermissions": return "bypass"
-        case "acceptEdits": return "accept"
-        case "auto", "dontAsk": return "auto"  // dontAsk is the legacy name
-        default: return permissionMode
+        var base = d["base_status"]?.stringValue ?? ""
+        if base.isEmpty {
+            base = d["status"]?.stringValue ?? SessionStatus.starting.rawValue
         }
-    }
+        if legacy && base == SessionStatus.permission.rawValue {
+            // Schema-1 PERMISSION: keep it visible until the main agent moves on.
+            base = (d["tool_name"]?.isTruthy ?? false)
+                ? SessionStatus.executing.rawValue
+                : SessionStatus.thinking.rawValue
+            pending = ["main": PendingPrompt(tool: d["tool_name"]?.stringValue ?? "", fp: "", since: lastTs)]
+        }
+        let background = d["background"]?.objectValue ?? [:]
 
-    /// AI-generated session title when available, else the latest prompt/topic.
-    var displayTopic: String { title.isEmpty ? topic : title }
+        let statusTs = d["status_ts"]?.numberValue ?? 0
+        let started = d["started_at"]?.stringValue ?? ""
 
-    /// True for the 1M-context model variant (its id ends with "[1m]").
-    var hasLargeContext: Bool { model.lowercased().contains("[1m]") }
-
-    var isActive: Bool {
-        parsedStatus != .ended
-    }
-
-    enum CodingKeys: String, CodingKey {
-        case sessionId = "session_id"
-        case cwd
-        case project
-        case status
-        case toolName = "tool_name"
-        case permissionMode = "permission_mode"
-        case model
-        case topic
-        case title
-        case lastPrompt = "last_prompt"
-        case toolCount = "tool_count"
-        case startedAt = "started_at"
-        case lastUpdated = "last_updated"
-        case subagents
+        let sid = d["session_id"]?.stringValue ?? ""
+        sessionId = sid.isEmpty ? fallbackId : sid
+        cwd = d["cwd"]?.stringValue ?? ""
+        project = d["project"]?.stringValue ?? ""
+        baseStatus = SessionStatus(lenient: base)
+        self.statusTs = statusTs != 0 ? statusTs : lastTs
+        activityTs = lastTs
+        toolName = d["tool_name"]?.stringValue
+        permissionMode = d["permission_mode"]?.stringValue ?? ""
+        model = d["model"]?.stringValue ?? ""
+        effort = d["effort"]?.stringValue ?? ""
+        contextTokens = d["context_tokens"]?.intValue ?? 0
+        topic = d["topic"]?.stringValue ?? ""
+        lastPrompt = d["last_prompt"]?.stringValue ?? ""
+        customTitle = d["custom_title"]?.stringValue ?? ""
+        // Schema 1 stored the AI title in "title".
+        let ai = d["ai_title"]?.stringValue ?? ""
+        aiTitle = !ai.isEmpty ? ai : (legacy ? d["title"]?.stringValue ?? "" : "")
+        toolCount = d["tool_count"]?.intValue ?? 0
+        startedAt = started
+        self.pending = pending
+        lastError = d["last_error"]?.stringValue ?? ""
+        var types: [String: Int] = [:]
+        for (key, value) in background["types"]?.objectValue ?? [:] {
+            types[key] = value.intValue ?? 0
+        }
+        self.background = BackgroundTasks(active: background["active"]?.intValue ?? 0, types: types)
+        crons = d["crons"]?.intValue ?? 0
+        subagents = (d["subagents"]?.arrayValue ?? []).compactMap { item in
+            guard let sa = item.objectValue, sa["agent_id"]?.isTruthy == true else { return nil }
+            return Subagent(json: sa)
+        }
+        subagentsOverflow = d["subagents_overflow"]?.intValue ?? 0
+        startDate = ISOTime.date(started)
     }
 
     init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        sessionId = try c.decode(String.self, forKey: .sessionId)
-        cwd = try c.decodeIfPresent(String.self, forKey: .cwd) ?? ""
-        project = try c.decodeIfPresent(String.self, forKey: .project) ?? ""
-        status = try c.decodeIfPresent(String.self, forKey: .status) ?? "STARTING"
-        toolName = try c.decodeIfPresent(String.self, forKey: .toolName)
-        permissionMode = try c.decodeIfPresent(String.self, forKey: .permissionMode) ?? ""
-        model = try c.decodeIfPresent(String.self, forKey: .model) ?? ""
-        topic = try c.decodeIfPresent(String.self, forKey: .topic) ?? ""
-        title = try c.decodeIfPresent(String.self, forKey: .title) ?? ""
-        lastPrompt = try c.decodeIfPresent(String.self, forKey: .lastPrompt) ?? ""
-        toolCount = try c.decodeIfPresent(Int.self, forKey: .toolCount) ?? 0
-        startedAt = try c.decodeIfPresent(String.self, forKey: .startedAt) ?? ""
-        lastUpdated = try c.decodeIfPresent(String.self, forKey: .lastUpdated) ?? ""
-        subagents = try c.decodeIfPresent([Subagent].self, forKey: .subagents) ?? []
-        // Parse dates once at decode time (ISO8601DateFormatter is very expensive)
-        startDate = ISO8601DateFormatter.flexible.date(from: startedAt)
-        lastUpdatedDate = ISO8601DateFormatter.flexible.date(from: lastUpdated)
+        let value = try JSONValue(from: decoder)
+        guard let object = value.objectValue else {
+            throw DecodingError.typeMismatch(
+                [String: JSONValue].self,
+                .init(codingPath: decoder.codingPath, debugDescription: "A session file must be a JSON object")
+            )
+        }
+        let fallback = decoder.userInfo[.sessionFallbackId] as? String ?? ""
+        self.init(json: object, fallbackId: fallback)
     }
 
-    // Custom Equatable: exclude pre-parsed dates (derived from startedAt/lastUpdated)
-    static func == (lhs: Session, rhs: Session) -> Bool {
-        lhs.sessionId == rhs.sessionId
-            && lhs.cwd == rhs.cwd
-            && lhs.project == rhs.project
-            && lhs.status == rhs.status
-            && lhs.toolName == rhs.toolName
-            && lhs.permissionMode == rhs.permissionMode
-            && lhs.model == rhs.model
-            && lhs.topic == rhs.topic
-            && lhs.title == rhs.title
-            && lhs.lastPrompt == rhs.lastPrompt
-            && lhs.toolCount == rhs.toolCount
-            && lhs.startedAt == rhs.startedAt
-            && lhs.lastUpdated == rhs.lastUpdated
-            && lhs.subagents == rhs.subagents
+    /// Decode one session file; `fallbackId` (the file name) is used when the
+    /// file has no `session_id`, like `read_session`/`list_sessions`.
+    static func decode(_ data: Data, fallbackId: String) throws -> Session {
+        let decoder = JSONDecoder()
+        decoder.userInfo[.sessionFallbackId] = fallbackId
+        return try decoder.decode(Session.self, from: data)
+    }
+
+    /// `parse_iso`: 0 when missing or invalid.
+    static func isoSeconds(_ value: JSONValue?) -> Double {
+        guard let text = value?.stringValue, !text.isEmpty else { return 0 }
+        return ISOTime.parse(text) ?? 0
     }
 }
 
-struct Subagent: Codable, Identifiable, Equatable {
+extension CodingUserInfoKey {
+    static let sessionFallbackId = CodingUserInfoKey(rawValue: "sessionFallbackId")!
+}
+
+/// A subagent row of a session (`subagents[]`).
+struct Subagent: Identifiable, Equatable, Sendable {
     let agentId: String
     let agentType: String
+    let description: String
+    let toolName: String?
+    let toolCount: Int
+    let startedAt: String
+    /// This agent's own clock (epoch seconds); legacy files: from `last_updated`.
+    let ts: Double
+    /// Derived by the writer from the session's pending map: "running" | "permission".
     let status: String
-    let lastUpdated: String
 
     var id: String { agentId }
 
     var parsedStatus: SessionStatus {
-        // Subagent statuses come as lowercase (e.g. "running") while
-        // SessionStatus uses uppercase rawValues ("THINKING", "EXECUTING", …).
-        // Map known subagent-specific values first, then try uppercase match.
-        switch status.lowercased() {
-        case "running": return .executing
-        default: return SessionStatus(rawValue: status.uppercased()) ?? .ended
-        }
+        status.lowercased() == "permission" ? .permission : .executing
     }
 
-    enum CodingKeys: String, CodingKey {
-        case agentId = "agent_id"
-        case agentType = "agent_type"
-        case status
-        case lastUpdated = "last_updated"
+    /// `SubagentState.from_dict`, plus the legacy-compatible `status` field.
+    init(json d: [String: JSONValue]) {
+        let ts = d["ts"]?.numberValue ?? 0
+        agentId = d["agent_id"]?.stringValue ?? ""
+        agentType = d["agent_type"]?.stringValue ?? ""
+        description = d["description"]?.stringValue ?? ""
+        toolName = d["tool_name"]?.stringValue
+        toolCount = d["tool_count"]?.intValue ?? 0
+        startedAt = d["started_at"]?.stringValue ?? ""
+        self.ts = ts != 0 ? ts : Session.isoSeconds(d["last_updated"])
+        status = d["status"]?.stringValue ?? "running"
     }
+}
 
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        agentId = try c.decode(String.self, forKey: .agentId)
-        agentType = try c.decodeIfPresent(String.self, forKey: .agentType) ?? ""
-        status = try c.decodeIfPresent(String.self, forKey: .status) ?? "running"
-        lastUpdated = try c.decodeIfPresent(String.self, forKey: .lastUpdated) ?? ""
+/// "1h 05m" / "4m 09s", or "-" when unknown.
+func formattedDuration(since start: Date?) -> String {
+    guard let start else { return "-" }
+    let duration = max(0, Date.now.timeIntervalSince(start))
+    let hours = Int(duration) / 3600
+    let minutes = (Int(duration) % 3600) / 60
+    let seconds = Int(duration) % 60
+    if hours > 0 {
+        return String(format: "%dh %02dm", hours, minutes)
     }
+    return String(format: "%dm %02ds", minutes, seconds)
+}
+
+/// "2 min. ago" style relative time, or "-" when unknown.
+func formattedRelative(_ date: Date?) -> String {
+    guard let date else { return "-" }
+    return RelativeDateTimeFormatter.monitor.localizedString(for: date, relativeTo: Date.now)
 }
 
 extension RelativeDateTimeFormatter {
     nonisolated(unsafe) static let monitor: RelativeDateTimeFormatter = {
         let f = RelativeDateTimeFormatter()
         f.unitsStyle = .abbreviated
-        return f
-    }()
-}
-
-extension ISO8601DateFormatter {
-    nonisolated(unsafe) static let flexible: ISO8601DateFormatter = {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return f
     }()
 }
