@@ -120,11 +120,12 @@ class InstallTest(unittest.TestCase):
         self.assertNotIn("async", session_end)  # synchronous on purpose
 
     def test_uninstall_removes_only_ours(self):
-        self.settings.write_text(json.dumps({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "other-tool"}]}]}}))
+        original = {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "other-tool"}]}], "ConfigChange": []}}
+        self.settings.write_text(json.dumps(original))
         self.run_cli("install")
+        self.assertEqual(json.loads(self.settings.read_text())["hooks"]["ConfigChange"], [])
         self.assertEqual(self.run_cli("uninstall").exit_code, 0)
-        data = json.loads(self.settings.read_text())
-        self.assertEqual(data, {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "other-tool"}]}]}})
+        self.assertEqual(json.loads(self.settings.read_text()), original)
 
     def test_unreadable_settings_are_left_alone(self):
         self.settings.write_text("{ not json")

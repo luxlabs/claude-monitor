@@ -119,14 +119,18 @@ def _save_settings(settings: dict) -> None:
 
 
 def _strip_our_hooks(existing: dict) -> dict:
-    """Remove claude-monitor entries from every event, dropping emptied events."""
+    """Remove claude-monitor entries from every event.
+
+    An event is dropped only when removing our entries emptied it; anything
+    else the user has (including empty lists) is kept as it was.
+    """
     cleaned = {}
     for event, entries in existing.items():
         if not isinstance(entries, list):
             cleaned[event] = entries
             continue
         kept = [h for h in entries if not _is_our_hook(h)]
-        if kept:
+        if kept or len(kept) == len(entries):
             cleaned[event] = kept
     return cleaned
 
