@@ -8,6 +8,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -65,9 +66,19 @@ def _is_our_hook(h: dict) -> bool:
     return False
 
 
+def _executable() -> str | None:
+    """The claude-monitor that is running `install` (not the first one on PATH:
+    an older, non-editable copy earlier on PATH would get the hooks instead).
+    Symlinks are kept, so a Homebrew/pipx shim survives upgrades."""
+    argv0 = sys.argv[0] if sys.argv else ""
+    if os.path.basename(argv0) == "claude-monitor" and os.path.isfile(argv0):
+        return os.path.abspath(argv0)
+    return shutil.which("claude-monitor")
+
+
 def _command(subcommand: str) -> str:
     """Absolute, shell-quoted command (paths with spaces break shell-form hooks)."""
-    path = shutil.which("claude-monitor")
+    path = _executable()
     return f"{shlex.quote(path)} {subcommand}" if path else f"claude-monitor {subcommand}"
 
 
@@ -167,6 +178,14 @@ def install() -> None:
 
     click.echo(f"Hooks installed in {SETTINGS_PATH}")
     click.echo(f"Monitoring events: {', '.join(HOOK_EVENTS)}")
+    registered = _executable()
+    first_on_path = shutil.which("claude-monitor")
+    click.echo(f"Hook command: {registered or 'claude-monitor'}")
+    if registered and first_on_path and os.path.realpath(first_on_path) != os.path.realpath(registered):
+        click.echo(
+            f"Note: another claude-monitor comes first on PATH ({first_on_path}). The hooks use {registered}; "
+            "remove the other copy if it is stale (e.g. `pipx uninstall claude-monitor`)."
+        )
     version = _claude_version()
     minimum = ".".join(map(str, MIN_CLAUDE_VERSION))
     if version is None:

@@ -133,6 +133,17 @@ class InstallTest(unittest.TestCase):
         self.assertNotEqual(result.exit_code, 0)
         self.assertEqual(self.settings.read_text(), "{ not json")
 
+    def test_registers_the_running_executable_not_the_first_on_path(self):
+        exe = Path(self._tmp.name) / "bin" / "claude-monitor"
+        exe.parent.mkdir()
+        exe.write_text("#!/bin/sh\n")
+        with mock.patch.object(cli_main.sys, "argv", [str(exe), "install"]), \
+                mock.patch.object(cli_main.shutil, "which", lambda name: "/elsewhere/claude-monitor"):
+            self.assertEqual(cli_main._executable(), str(exe))
+        with mock.patch.object(cli_main.sys, "argv", ["-c"]), \
+                mock.patch.object(cli_main.shutil, "which", lambda name: "/elsewhere/claude-monitor"):
+            self.assertEqual(cli_main._executable(), "/elsewhere/claude-monitor")
+
     def test_old_claude_version_warns(self):
         with mock.patch.object(cli_main, "_claude_version", lambda: (2, 1, 200)):
             result = self.run_cli("install")
