@@ -4,6 +4,7 @@
     "FRESH_MARGIN": 2.0,
     "SNAPSHOT_MAX_AGE": 15.0,
     "ABSENT_GRACE": 90.0,
+    "ABSENT_ACTIVE_GRACE": 900.0,
     "BACKGROUND_DECAY": 1800.0,
     "IDLE_HIDE_AFTER": 14400.0,
     "LEGACY_ACTIVE_HIDE": 3600.0
@@ -50,6 +51,20 @@
       "hook": {"base_status": "WAITING", "pending": {}, "status_ts": 99900.0, "activity_ts": 99900.0},
       "live": null,
       "expect": {"status": "WAITING", "detail": null, "hidden": true, "legacy": false, "untracked": false, "stale_idle": false}
+    },
+    {
+      "name": "unlisted mid-turn (claude -p is never listed): visible through a long silent tool call",
+      "now": 100000.0, "observed_at": 99999.0,
+      "hook": {"base_status": "EXECUTING", "pending": {}, "status_ts": 99800.0, "activity_ts": 99800.0},
+      "live": null,
+      "expect": {"status": "EXECUTING", "detail": null, "hidden": false, "legacy": false, "untracked": false, "stale_idle": false}
+    },
+    {
+      "name": "unlisted and silent mid-turn for 15 min: hidden",
+      "now": 100000.0, "observed_at": 99999.0,
+      "hook": {"base_status": "BACKGROUND", "pending": {}, "status_ts": 99000.0, "activity_ts": 99000.0},
+      "live": null,
+      "expect": {"status": "BACKGROUND", "detail": null, "hidden": true, "legacy": false, "untracked": false, "stale_idle": false}
     },
     {
       "name": "live data older than the hook's last transition + 2 s: hook wins",

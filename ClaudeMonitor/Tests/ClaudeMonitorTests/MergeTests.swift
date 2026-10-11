@@ -59,6 +59,7 @@ final class MergeTests: XCTestCase {
             "FRESH_MARGIN": Merge.freshMargin,
             "SNAPSHOT_MAX_AGE": Merge.snapshotMaxAge,
             "ABSENT_GRACE": Merge.absentGrace,
+            "ABSENT_ACTIVE_GRACE": Merge.absentActiveGrace,
             "BACKGROUND_DECAY": Merge.backgroundDecay,
             "IDLE_HIDE_AFTER": Merge.idleHideAfter,
             "LEGACY_ACTIVE_HIDE": Merge.legacyActiveHide,

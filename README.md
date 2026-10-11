@@ -133,8 +133,8 @@ Applied by `live.effective()` (TUI) and `Merge.effective` (app), tested against 
 | `idle` | `THINKING` / `EXECUTING` / `STARTING` / `COMPACTING`, or a main prompt | `WAITING` |
 | `busy` | `WAITING` / `STARTING` | `THINKING` |
 | `idle` / `busy` | anything else | hook status without its stale prompts (`BACKGROUND` kept) |
-| not listed | activity in the last 90 s | hook status |
-| not listed | silent for 90 s | hidden |
+| not listed | activity in the last 90 s (15 min mid-turn: `claude -p` sessions are never listed) | hook status |
+| not listed | silent longer than that | hidden |
 | no fresh snapshot | any | hook status; active statuses silent for an hour are hidden |
 
 Live sessions without a state file (hooks not installed, `--restricted`, settings excluded) appear as **untracked** rows. `WAITING` sessions idle for more than 4 hours, and untracked idle ones, are hidden unless "show idle" is on.

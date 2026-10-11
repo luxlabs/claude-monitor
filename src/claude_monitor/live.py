@@ -32,12 +32,16 @@ from claude_monitor.state import (
 FRESH_MARGIN = 2.0  # live data must postdate the hook's last transition by this much
 SNAPSHOT_MAX_AGE = 15.0  # older snapshots are ignored (hooks-only mode)
 ABSENT_GRACE = 90.0  # hook activity this recent keeps an unlisted session visible
+# `claude -p` sessions are never listed by `claude agents --json`: one in the
+# middle of a turn can stay silent (a long tool call) while alive.
+ABSENT_ACTIVE_GRACE = 900.0
 BACKGROUND_DECAY = 1800.0  # BACKGROUND with no agent activity for 30 min shows as WAITING
 IDLE_HIDE_AFTER = 4 * 3600.0  # idle sessions older than this are hidden unless "show all"
 LEGACY_ACTIVE_HIDE = 3600.0  # hooks-only mode: an active status this old is presumed dead
 POLL_TIMEOUT = 5.0
 
 _LEGACY_ACTIVE = {THINKING, EXECUTING, PERMISSION, STARTING, COMPACTING}
+_ABSENT_ACTIVE = {THINKING, EXECUTING, PERMISSION, COMPACTING, BACKGROUND}
 _CLAUDE_CANDIDATES = (
     "~/.local/bin/claude",
     "/opt/homebrew/bin/claude",
@@ -333,7 +337,8 @@ def effective(
     if observed_at is None or now - observed_at > SNAPSHOT_MAX_AGE:
         return result(hook_status, legacy=True)
     if live is None:
-        return result(hook_status, hidden=now - hook.activity_ts >= ABSENT_GRACE)
+        grace = ABSENT_ACTIVE_GRACE if hook_status in _ABSENT_ACTIVE else ABSENT_GRACE
+        return result(hook_status, hidden=now - hook.activity_ts >= grace)
 
     latest = max([hook.status_ts] + [float(p.get("since") or 0) for p in hook.pending.values()])
     if observed_at <= latest + FRESH_MARGIN:

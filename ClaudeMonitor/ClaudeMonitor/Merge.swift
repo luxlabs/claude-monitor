@@ -138,6 +138,9 @@ enum Merge {
     static let snapshotMaxAge: Double = 15.0
     /// Hook activity this recent keeps an unlisted session visible.
     static let absentGrace: Double = 90.0
+    /// `claude -p` sessions are never listed by `claude agents --json`: one in
+    /// the middle of a turn can stay silent (a long tool call) while alive.
+    static let absentActiveGrace: Double = 900.0
     /// BACKGROUND with no agent activity for 30 min shows as WAITING.
     static let backgroundDecay: Double = 1800.0
     /// Idle sessions older than this are hidden unless "show all".
@@ -147,6 +150,7 @@ enum Merge {
     static let pollTimeout: Double = 5.0
 
     private static let legacyActive: Set<SessionStatus> = [.thinking, .executing, .permission, .starting, .compacting]
+    private static let absentActive: Set<SessionStatus> = [.thinking, .executing, .permission, .compacting, .background]
 
     static func liveOnlyStatus(_ live: LiveEntry) -> SessionStatus {
         if live.status == "waiting" {
@@ -204,7 +208,8 @@ enum Merge {
             return result(hookStatus, legacy: true)
         }
         guard let live else {
-            return result(hookStatus, hidden: now - hook.activityTs >= absentGrace)
+            let grace = absentActive.contains(hookStatus) ? absentActiveGrace : absentGrace
+            return result(hookStatus, hidden: now - hook.activityTs >= grace)
         }
 
         let latest = ([hook.statusTs] + hook.pending.values.map(\.since)).max() ?? hook.statusTs
