@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 import json
-import sys
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 
 import click
@@ -15,6 +20,7 @@ HOOK_EVENTS = [
     "UserPromptSubmit",
     "PreToolUse",
     "PermissionRequest",
+    "PermissionDenied",  # auto mode refused a call: the tool never runs
     "PostToolUse",
     "PostToolUseFailure",  # tool failures no longer fire PostToolUse
     "Stop",
@@ -25,100 +31,113 @@ HOOK_EVENTS = [
     "SubagentStop",
     "Elicitation",  # MCP server waiting on the user
     "ElicitationResult",  # user answered the MCP prompt
+    "PreCompact",
+    "PostCompact",
+    "PostModelSwitch",  # /model, opusplan, automatic fallback (Claude Code 2.1.251+)
 ]
 
+# SessionEnd runs synchronously: `claude -p` kills async hooks still running
+# when it exits, which would leave the session's file behind.
+SYNC_EVENTS = {"SessionEnd"}
+
 # Refresh usage when a turn ends (Stop / StopFailure) or a new prompt starts.
-# StopFailure is included because a rate_limit/billing error is exactly when
-# fresh limit data is most useful.
+# The usage hook throttles itself, so many sessions don't hammer the endpoint.
 USAGE_HOOK_EVENTS = ["Stop", "StopFailure", "UserPromptSubmit"]
 
+MIN_CLAUDE_VERSION = (2, 1, 251)
+
 HOOK_MARKER = "claude-monitor"
+
+
+class SettingsError(click.ClickException):
+    pass
 
 
 def _is_our_hook(h: dict) -> bool:
     """Check if a hook entry belongs to claude-monitor (flat or nested format)."""
     if not isinstance(h, dict):
         return False
-    # Flat format: {"type": "command", "command": "...claude-monitor..."}
-    if HOOK_MARKER in h.get("command", ""):
+    if HOOK_MARKER in str(h.get("command", "")):
         return True
-    # Nested format: {"hooks": [{"command": "...claude-monitor..."}], "matcher": "..."}
-    for sub in h.get("hooks", []):
-        if isinstance(sub, dict) and HOOK_MARKER in sub.get("command", ""):
+    for sub in h.get("hooks", []) if isinstance(h.get("hooks"), list) else []:
+        if isinstance(sub, dict) and HOOK_MARKER in str(sub.get("command", "")):
             return True
     return False
 
 
-def _get_hook_command() -> str:
-    """Get the hook command that invokes our handler using absolute path."""
-    import shutil
-
-    cmd = shutil.which("claude-monitor")
-    if cmd:
-        return f"{cmd} hook"
-    return "claude-monitor hook"
-
-
-def _get_usage_hook_command() -> str:
-    """Get the hook command that fetches usage data."""
-    import shutil
-
-    cmd = shutil.which("claude-monitor")
-    if cmd:
-        return f"{cmd} usage-hook"
-    return "claude-monitor usage-hook"
+def _command(subcommand: str) -> str:
+    """Absolute, shell-quoted command (paths with spaces break shell-form hooks)."""
+    path = shutil.which("claude-monitor")
+    return f"{shlex.quote(path)} {subcommand}" if path else f"claude-monitor {subcommand}"
 
 
 def _build_hooks_config() -> dict:
-    """Build the hooks configuration for all monitored events.
-
-    Uses the nested format with matcher, matching the internal Claude Code
-    hook structure: each entry has a "hooks" array and a "matcher" pattern.
-    """
-    command = _get_hook_command()
-    usage_command = _get_usage_hook_command()
+    """Hook entries for every monitored event, in Claude Code's nested format."""
+    command = _command("hook")
+    usage_command = _command("usage-hook")
     hooks: dict[str, list[dict]] = {}
-
     for event in HOOK_EVENTS:
-        hook_handlers = [
-            {
-                "type": "command",
-                "command": command,
-                "async": True,
-            }
-        ]
-        # Add usage fetch hook on Stop and UserPromptSubmit
+        handler: dict = {"type": "command", "command": command}
+        if event not in SYNC_EVENTS:
+            handler["async"] = True
+        handlers = [handler]
         if event in USAGE_HOOK_EVENTS:
-            hook_handlers.append({
-                "type": "command",
-                "command": usage_command,
-                "async": True,
-            })
-
-        hooks[event] = [
-            {
-                "matcher": ".*",
-                "hooks": hook_handlers,
-            }
-        ]
-
+            handlers.append({"type": "command", "command": usage_command, "async": True})
+        hooks[event] = [{"matcher": ".*", "hooks": handlers}]
     return hooks
 
 
 def _load_settings() -> dict:
-    """Load existing settings or return empty dict."""
-    if SETTINGS_PATH.exists():
-        try:
-            return json.loads(SETTINGS_PATH.read_text())
-        except (json.JSONDecodeError, OSError):
-            return {}
-    return {}
+    """Load settings; refuse to continue if the file exists but can't be parsed."""
+    if not SETTINGS_PATH.exists():
+        return {}
+    try:
+        data = json.loads(SETTINGS_PATH.read_text())
+    except (OSError, ValueError) as exc:
+        raise SettingsError(f"Cannot read {SETTINGS_PATH} ({exc}); fix it and retry. Nothing was changed.")
+    if not isinstance(data, dict):
+        raise SettingsError(f"{SETTINGS_PATH} is not a JSON object; nothing was changed.")
+    return data
 
 
 def _save_settings(settings: dict) -> None:
-    """Save settings to disk."""
+    """Atomic write that keeps every key we didn't touch."""
     SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    SETTINGS_PATH.write_text(json.dumps(settings, indent=2) + "\n")
+    fd, tmp = tempfile.mkstemp(dir=SETTINGS_PATH.parent, prefix=".settings.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(settings, indent=2) + "\n")
+        if SETTINGS_PATH.exists():
+            os.chmod(tmp, SETTINGS_PATH.stat().st_mode & 0o777)
+        os.replace(tmp, SETTINGS_PATH)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _strip_our_hooks(existing: dict) -> dict:
+    """Remove claude-monitor entries from every event, dropping emptied events."""
+    cleaned = {}
+    for event, entries in existing.items():
+        if not isinstance(entries, list):
+            cleaned[event] = entries
+            continue
+        kept = [h for h in entries if not _is_our_hook(h)]
+        if kept:
+            cleaned[event] = kept
+    return cleaned
+
+
+def _claude_version() -> tuple[int, ...] | None:
+    try:
+        out = subprocess.run(["claude", "--version"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)", out.stdout)
+    return tuple(int(x) for x in m.groups()) if m else None
 
 
 @click.group(invoke_without_command=True)
@@ -135,50 +154,36 @@ def cli(ctx: click.Context) -> None:
 def install() -> None:
     """Install hooks into ~/.claude/settings.json."""
     settings = _load_settings()
-    hooks_config = _build_hooks_config()
-
-    existing_hooks = settings.get("hooks", {})
-
-    for event, hook_list in hooks_config.items():
-        event_hooks = existing_hooks.get(event, [])
-        # Remove any existing claude-monitor hooks (both flat and nested formats)
-        event_hooks = [
-            h for h in event_hooks
-            if not _is_our_hook(h)
-        ]
-        # Add our hook
-        event_hooks.extend(hook_list)
-        existing_hooks[event] = event_hooks
-
-    settings["hooks"] = existing_hooks
+    existing = settings.get("hooks") if isinstance(settings.get("hooks"), dict) else {}
+    hooks = _strip_our_hooks(existing)
+    for event, entries in _build_hooks_config().items():
+        hooks[event] = hooks.get(event, []) + entries
+    settings["hooks"] = hooks
     _save_settings(settings)
 
     click.echo(f"Hooks installed in {SETTINGS_PATH}")
     click.echo(f"Monitoring events: {', '.join(HOOK_EVENTS)}")
+    version = _claude_version()
+    minimum = ".".join(map(str, MIN_CLAUDE_VERSION))
+    if version is None:
+        click.echo(f"Note: couldn't run `claude --version`; claude-monitor needs Claude Code {minimum} or later.")
+    elif version < MIN_CLAUDE_VERSION:
+        click.echo(
+            f"Warning: Claude Code {'.'.join(map(str, version))} is older than {minimum}; "
+            "update it (older versions may reject newer hook events such as PostModelSwitch)."
+        )
 
 
 @cli.command()
 def uninstall() -> None:
     """Remove hooks from ~/.claude/settings.json."""
     settings = _load_settings()
-    existing_hooks = settings.get("hooks", {})
-
-    for event in HOOK_EVENTS:
-        event_hooks = existing_hooks.get(event, [])
-        event_hooks = [
-            h for h in event_hooks
-            if not _is_our_hook(h)
-        ]
-        if event_hooks:
-            existing_hooks[event] = event_hooks
-        else:
-            existing_hooks.pop(event, None)
-
-    if existing_hooks:
-        settings["hooks"] = existing_hooks
+    existing = settings.get("hooks") if isinstance(settings.get("hooks"), dict) else {}
+    hooks = _strip_our_hooks(existing)
+    if hooks:
+        settings["hooks"] = hooks
     else:
         settings.pop("hooks", None)
-
     _save_settings(settings)
     click.echo(f"Hooks removed from {SETTINGS_PATH}")
 
