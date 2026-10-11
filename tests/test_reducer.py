@@ -94,8 +94,9 @@ class PromptTest(unittest.TestCase):
     def test_injected_prompts_keep_topic(self):
         s = play([(ev("UserPromptSubmit", prompt="<task-notification>\n<task-id>a1</task-id>…"), 5.0)], started())
         self.assertEqual((s.status, s.topic), (THINKING, "fix the bug"))
-        for tag in ("teammate-message", "cross-session-message"):
+        for tag in ("agent-message", "teammate-message", "cross-session-message"):
             self.assertTrue(is_injected(f"<{tag} from='x'>hi</{tag}>"))
+        self.assertFalse(is_injected("please read <agent-message> docs"))
 
     def test_clean_prompt(self):
         self.assertEqual(clean_prompt("<ide_selection>x</ide_selection> hello"), "hello")

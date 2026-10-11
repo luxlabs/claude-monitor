@@ -62,8 +62,8 @@ AGENT_TASK_TYPES = {"subagent", "teammate"}
 _IDE_TAG_RE = re.compile(r"<ide_\w+>.*?</ide_\w+>", re.DOTALL)
 _SYSTEM_TAG_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTALL)
 # Prompts Claude Code submits on its own: background-agent reports,
-# teammate messages, messages from other sessions.
-_INJECTED_RE = re.compile(r"^\s*<(task-notification|teammate-message|cross-session-message)\b")
+# agent hand-backs, teammate messages, messages from other sessions.
+_INJECTED_RE = re.compile(r"^\s*<(task-notification|agent-message|teammate-message|cross-session-message)\b")
 _COMMAND_NAME_RE = re.compile(r"<command-name>(.*?)</command-name>", re.DOTALL)
 _COMMAND_ARGS_RE = re.compile(r"<command-args>(.*?)</command-args>", re.DOTALL)
 
