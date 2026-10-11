@@ -319,8 +319,14 @@ def _task_active(task: dict) -> bool:
     return str(task.get("status") or "").lower() not in INACTIVE_TASK_STATUSES
 
 
-def _apply_background_tasks(s: SessionState, tasks, now: float, reconcile: bool) -> None:
-    """Update the background summary; on Stop also reconcile the subagent list."""
+def _apply_background_tasks(s: SessionState, tasks, now: float, reconcile: bool, stopping: str = "") -> None:
+    """Update the background summary; on Stop also reconcile the subagent list.
+
+    ``stopping`` is the agent whose SubagentStop carried the list: Claude Code
+    still reports it as running there, so it must not count.
+    """
+    if isinstance(tasks, list) and stopping:
+        tasks = [t for t in tasks if not (isinstance(t, dict) and t.get("id") == stopping)]
     if not isinstance(tasks, list):
         if reconcile:
             # No task registry info (older Claude Code): subagents were turn-scoped.
@@ -381,7 +387,8 @@ def _subagent_stop(s: SessionState, data: dict, now: float) -> None:
         s.ended_agents = ([e for e in s.ended_agents if e[0] != agent_id] + [[agent_id, now]])[-ENDED_AGENTS_LIMIT:]
     # SubagentStop's background_tasks covers the whole session. The status is
     # left alone: the report-back turn that follows ends with its own Stop.
-    _apply_background_tasks(s, data.get("background_tasks"), now, reconcile=False)
+    _apply_background_tasks(s, data.get("background_tasks"), now, reconcile=False,
+                            stopping=agent_id if isinstance(agent_id, str) else "")
 
 
 def _subagent_event(s: SessionState, event: str, data: dict, facts: Facts, now: float, agent_id: str) -> None:

@@ -1,5 +1,7 @@
 import itertools
+import json
 import unittest
+from pathlib import Path
 
 from claude_monitor.hook import Facts, clean_prompt, fingerprint, is_injected, reduce
 from claude_monitor.state import (
@@ -316,6 +318,29 @@ class SubagentTest(unittest.TestCase):
         steps = [(ev("SubagentStart", agent_id=f"a{i}"), 3.0 + i / 1000) for i in range(SUBAGENT_LIMIT + 5)]
         s = play(steps, started())
         self.assertEqual((len(s.subagents), s.subagents_overflow), (SUBAGENT_LIMIT, 5))
+
+
+class RealPayloadReplayTest(unittest.TestCase):
+    """Payloads recorded from a real `claude -p` run (Claude Code 2.1.296) that
+    used Bash and a background Explore subagent. The run ended before its last
+    Stop/SessionEnd hooks could fire, as `-p` does to async hooks."""
+
+    def test_replay(self):
+        path = Path(__file__).parent / "fixtures" / "real_headless_session.jsonl"
+        events = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+        state = None
+        seen = {}
+        for i, data in enumerate(events):
+            state = reduce(state, data, NO_FACTS, 1000.0 + i) or state
+            seen.setdefault(data["hook_event_name"], state.status if state else None)
+        self.assertEqual(seen["Stop"], BACKGROUND)  # the Explore agent was still running
+        self.assertEqual(state.status, THINKING)  # the agent's report-back turn
+        self.assertEqual(state.tool_count, 2)  # Bash + Agent; the subagent's Glob calls don't count
+        self.assertTrue(state.topic.startswith("First run the shell command"))
+        self.assertEqual(state.subagents, [])
+        self.assertEqual(state.bg_active, 0)
+        self.assertEqual([e[0] for e in state.ended_agents], ["a644f9bcbe56d435a"])
+        self.assertEqual((state.effort, state.permission_mode), ("medium", "dontAsk"))
 
 
 class LifecycleTest(unittest.TestCase):
