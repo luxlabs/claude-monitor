@@ -16,14 +16,21 @@ HOOK_EVENTS = [
     "PreToolUse",
     "PermissionRequest",
     "PostToolUse",
+    "PostToolUseFailure",  # tool failures no longer fire PostToolUse
     "Stop",
+    "StopFailure",  # API errors end the turn without a Stop
     "SessionEnd",
     "Notification",
     "SubagentStart",
     "SubagentStop",
+    "Elicitation",  # MCP server waiting on the user
+    "ElicitationResult",  # user answered the MCP prompt
 ]
 
-USAGE_HOOK_EVENTS = ["Stop", "UserPromptSubmit"]
+# Refresh usage when a turn ends (Stop / StopFailure) or a new prompt starts.
+# StopFailure is included because a rate_limit/billing error is exactly when
+# fresh limit data is most useful.
+USAGE_HOOK_EVENTS = ["Stop", "StopFailure", "UserPromptSubmit"]
 
 HOOK_MARKER = "claude-monitor"
 

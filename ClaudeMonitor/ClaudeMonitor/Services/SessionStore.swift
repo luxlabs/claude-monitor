@@ -9,6 +9,7 @@ final class SessionStore {
     private(set) var waitingSessions: Set<String> = []
     private(set) var usage: UsageResponse?
     private(set) var ideInfoBySessionId: [String: IdeInfo] = [:]
+    private(set) var pidsBySessionId: [String: [pid_t]] = [:]
 
     private var previousStates: [String: String] = [:]
     private var attentionRequests: [String: Int] = [:]
@@ -74,6 +75,7 @@ final class SessionStore {
         cleanupStaleFiles()
         reloadIdeLockFiles()
         reload()
+        refreshProcessMappings()
 
         // File system monitors (debounced at 2s — with many active sessions,
         // shorter debounce causes too-frequent reloads)
@@ -90,11 +92,12 @@ final class SessionStore {
             }
         }
 
-        // Slow timer for zombie cleanup and permission override.
+        // Slow timer for zombie cleanup, permission override, and process discovery.
         // Covers cases where the session file is NOT updated (so DirectoryMonitor won't fire).
         zombieTimer = Timer.scheduledTimer(withTimeInterval: 30.0, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.reload()
+                self?.refreshProcessMappings()
             }
         }
     }
@@ -261,6 +264,23 @@ final class SessionStore {
                     usage = decoded
                 }
             }
+        }
+
+    }
+
+    // MARK: - Process Discovery
+
+    private func refreshProcessMappings() {
+        let newMapping = ProcessDiscovery.pidsBySession(for: sessions)
+        if newMapping != pidsBySessionId {
+            pidsBySessionId = newMapping
+        }
+    }
+
+    func killProcess(pid: pid_t, force: Bool) {
+        kill(pid, force ? SIGKILL : SIGTERM)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.refreshProcessMappings()
         }
     }
 

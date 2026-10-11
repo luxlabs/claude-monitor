@@ -6,12 +6,48 @@ import json
 import os
 import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+try:
+    import fcntl  # POSIX advisory file locking
+except ImportError:  # pragma: no cover - non-Unix; hooks target macOS/Linux
+    fcntl = None
+
 MONITOR_DIR = Path.home() / ".claude" / "monitor" / "sessions"
 ZOMBIE_THRESHOLD_HOURS = 24
+
+# Single advisory lock guarding every read-modify-write of a session file.
+# Hooks are registered with "async": True, so a burst of events runs as parallel
+# processes — and a workflow spawns up to 16 subagents at once. Without this lock
+# their read-modify-write cycles interleave and silently drop subagents (and can
+# regress status). One lock for the whole monitor dir is enough: each critical
+# section is a sub-millisecond file read plus an atomic rename.
+_WRITE_LOCK_PATH = MONITOR_DIR.parent / ".write.lock"
+
+
+@contextmanager
+def write_lock():
+    """Serialize session read-modify-write across concurrent hook processes.
+
+    Best-effort: a no-op where ``fcntl`` is unavailable (non-Unix). The kernel
+    releases the lock automatically if the holding process exits.
+    """
+    if fcntl is None:
+        yield
+        return
+    MONITOR_DIR.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(_WRITE_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
 
 @dataclass
@@ -32,6 +68,7 @@ class SessionState:
     permission_mode: str = ""
     model: str = ""
     topic: str = ""
+    title: str = ""
     last_prompt: str = ""
     tool_count: int = 0
     started_at: str = ""
@@ -58,18 +95,21 @@ def _session_path(session_id: str) -> Path:
     return MONITOR_DIR / f"{session_id}.json"
 
 
-def write_session(state: SessionState) -> None:
+def write_session(state: SessionState, *, check_regression: bool = True) -> None:
     """Atomically write session state to disk.
 
-    Includes anti-regression: if a later hook (with a newer last_updated)
-    already wrote to the file, skip this write to avoid async race conditions
-    (e.g. PreToolUse overwriting Stop).
+    Anti-regression (``check_regression``): if a later hook (with a newer
+    last_updated) already wrote to the file, skip this write to avoid async
+    race conditions (e.g. PreToolUse overwriting Stop). Callers that already
+    hold :func:`write_lock` and only mutate the subagent list pass
+    ``check_regression=False`` so an idempotent add/remove is never dropped just
+    because a sibling event happened to carry a marginally newer timestamp.
     """
     _ensure_dir()
     path = _session_path(state.session_id)
 
     # Anti-regression: don't overwrite with a stale event
-    if path.exists():
+    if check_regression and path.exists():
         try:
             existing = json.loads(path.read_text())
             existing_ts = existing.get("last_updated", "")
@@ -87,6 +127,7 @@ def write_session(state: SessionState) -> None:
         "permission_mode": state.permission_mode,
         "model": state.model,
         "topic": state.topic,
+        "title": state.title,
         "last_prompt": state.last_prompt,
         "tool_count": state.tool_count,
         "started_at": state.started_at,
@@ -156,6 +197,7 @@ def get_sessions() -> list[SessionState]:
             permission_mode=data.get("permission_mode", ""),
             model=data.get("model", ""),
             topic=data.get("topic", ""),
+            title=data.get("title", ""),
             last_prompt=data.get("last_prompt", ""),
             tool_count=data.get("tool_count", 0),
             started_at=data.get("started_at", ""),

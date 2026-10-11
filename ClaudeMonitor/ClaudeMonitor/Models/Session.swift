@@ -9,6 +9,7 @@ struct Session: Codable, Identifiable, Equatable {
     let permissionMode: String
     let model: String
     let topic: String
+    let title: String
     let lastPrompt: String
     let toolCount: Int
     let startedAt: String
@@ -51,6 +52,7 @@ struct Session: Codable, Identifiable, Equatable {
         if model.contains("opus") { return "opus" }
         if model.contains("sonnet") { return "sonnet" }
         if model.contains("haiku") { return "haiku" }
+        if model.contains("fable") { return "fable" }
         return model
     }
 
@@ -58,10 +60,16 @@ struct Session: Codable, Identifiable, Equatable {
         switch permissionMode {
         case "bypassPermissions": return "bypass"
         case "acceptEdits": return "accept"
-        case "dontAsk": return "auto"
+        case "auto", "dontAsk": return "auto"  // dontAsk is the legacy name
         default: return permissionMode
         }
     }
+
+    /// AI-generated session title when available, else the latest prompt/topic.
+    var displayTopic: String { title.isEmpty ? topic : title }
+
+    /// True for the 1M-context model variant (its id ends with "[1m]").
+    var hasLargeContext: Bool { model.lowercased().contains("[1m]") }
 
     var isActive: Bool {
         parsedStatus != .ended
@@ -76,6 +84,7 @@ struct Session: Codable, Identifiable, Equatable {
         case permissionMode = "permission_mode"
         case model
         case topic
+        case title
         case lastPrompt = "last_prompt"
         case toolCount = "tool_count"
         case startedAt = "started_at"
@@ -93,6 +102,7 @@ struct Session: Codable, Identifiable, Equatable {
         permissionMode = try c.decodeIfPresent(String.self, forKey: .permissionMode) ?? ""
         model = try c.decodeIfPresent(String.self, forKey: .model) ?? ""
         topic = try c.decodeIfPresent(String.self, forKey: .topic) ?? ""
+        title = try c.decodeIfPresent(String.self, forKey: .title) ?? ""
         lastPrompt = try c.decodeIfPresent(String.self, forKey: .lastPrompt) ?? ""
         toolCount = try c.decodeIfPresent(Int.self, forKey: .toolCount) ?? 0
         startedAt = try c.decodeIfPresent(String.self, forKey: .startedAt) ?? ""
@@ -113,6 +123,7 @@ struct Session: Codable, Identifiable, Equatable {
             && lhs.permissionMode == rhs.permissionMode
             && lhs.model == rhs.model
             && lhs.topic == rhs.topic
+            && lhs.title == rhs.title
             && lhs.lastPrompt == rhs.lastPrompt
             && lhs.toolCount == rhs.toolCount
             && lhs.startedAt == rhs.startedAt

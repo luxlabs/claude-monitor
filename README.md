@@ -25,9 +25,10 @@ flowchart LR
 
 | Pattern | Detail |
 |---|---|
-| **Event-driven** | 10 Claude Code hook events mapped to state transitions |
+| **Event-driven** | 14 Claude Code hook events mapped to state transitions |
 | **File-based IPC** | JSON files in `~/.claude/monitor/sessions/` as single source of truth |
 | **Atomic writes** | Temp file + `os.replace()` to prevent partial reads |
+| **Concurrency-safe writes** | Advisory `flock` serializes the read-modify-write, so parallel `async` hooks — a workflow spawns up to 16 subagents at once — never drop subagent updates |
 | **Directory monitoring** | `DispatchSource` (macOS) / 1s polling (Python) |
 | **Zombie cleanup** | Automatic removal of stale sessions with per-status thresholds |
 
@@ -68,13 +69,14 @@ stateDiagram-v2
     STARTING --> THINKING : UserPromptSubmit
 
     THINKING --> EXECUTING : PreToolUse
-    EXECUTING --> THINKING : PostToolUse
-    EXECUTING --> PERMISSION : PreToolUse (user-input tools)
+    EXECUTING --> THINKING : PostToolUse / PostToolUseFailure
+    EXECUTING --> PERMISSION : PreToolUse (user-input tools) / Elicitation
 
     THINKING --> PERMISSION : PermissionRequest / Notification
-    PERMISSION --> THINKING : PostToolUse
+    PERMISSION --> THINKING : PostToolUse / PostToolUseFailure / ElicitationResult
 
-    THINKING --> WAITING : Stop
+    THINKING --> WAITING : Stop / StopFailure
+    EXECUTING --> WAITING : Stop / StopFailure
     WAITING --> THINKING : UserPromptSubmit
 
     WAITING --> [*] : SessionEnd
@@ -83,15 +85,19 @@ stateDiagram-v2
 
 | Hook Event | Resulting State | Notes |
 |---|---|---|
-| `SessionStart` | `STARTING` | Session init, model extraction |
+| `SessionStart` | `STARTING` | Session init, model extraction. On `source == "compact"` the prior state is kept (compaction happens mid-session) |
 | `UserPromptSubmit` | `THINKING` | Saves the prompt; the first one becomes the topic |
 | `PreToolUse` | `EXECUTING` | Records the tool name being used |
 | `PreToolUse` | `PERMISSION` | Override for user-input tools (`ExitPlanMode`, `AskUserQuestion`) that prompt the user for approval without triggering `PermissionRequest` |
 | `PermissionRequest` | `PERMISSION` | Waiting for user confirmation |
-| `PostToolUse` | `THINKING` | Increments the tool counter |
+| `PostToolUse` | `THINKING` | Tool succeeded; increments the tool counter |
+| `PostToolUseFailure` | `THINKING` | Tool failed; also increments the counter. Recent Claude Code fires this instead of `PostToolUse` on failure — without it a session stays stuck in `EXECUTING`/`PERMISSION` |
 | `Stop` | `WAITING` | Session waiting for next prompt |
+| `StopFailure` | `WAITING` | Turn ended on an API error (rate limit, overload, billing, …); the session is idle. Without it a session stays stuck in `THINKING`/`EXECUTING` |
 | `SessionEnd` | *(removed)* | State file is deleted |
 | `Notification` | `PERMISSION`* | Only when `notification_type == "permission_prompt"` |
+| `Elicitation` | `PERMISSION` | An MCP server is waiting for user input during a tool call |
+| `ElicitationResult` | `THINKING` | User answered the MCP prompt; clears the elicitation `PERMISSION` |
 | `SubagentStart` | — | Adds subagent to the session's list |
 | `SubagentStop` | — | Removes subagent from the session's list |
 
@@ -117,8 +123,9 @@ Each session is saved to `~/.claude/monitor/sessions/{session_id}.json`:
   "status": "THINKING",
   "tool_name": null,
   "permission_mode": "default",
-  "model": "claude-opus-4-6",
+  "model": "claude-opus-4-8",
   "topic": "Implement feature X",
+  "title": "Feature X implementation",
   "last_prompt": "...",
   "tool_count": 12,
   "started_at": "2025-01-15T10:30:00+00:00",
@@ -133,6 +140,13 @@ Each session is saved to `~/.claude/monitor/sessions/{session_id}.json`:
   ]
 }
 ```
+
+The `title` field holds Claude Code's AI-generated session title (the `ai-title`
+transcript entry), refreshed at turn boundaries via a cheap tail-read; both UIs
+prefer it over `topic` (the latest prompt) when present. The macOS usage bar
+reads the API's modern `limits[]` array — including the model-scoped weekly
+limit and `extra_usage` — and falls back to the flat `five_hour`/`seven_day`
+windows if it's absent.
 
 ## Notifications (macOS app)
 

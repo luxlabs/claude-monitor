@@ -18,6 +18,7 @@ enum RowItem: Identifiable {
 
 struct SessionTableView: View {
     @Environment(SessionStore.self) private var store
+    @State private var killTarget: (pid: pid_t, force: Bool)?
 
     private var rows: [RowItem] {
         var items: [RowItem] = []
@@ -108,6 +109,18 @@ struct SessionTableView: View {
         }
         .frame(minWidth: 800, minHeight: 400)
         .navigationTitle("Claude Monitor")
+        .alert("Kill Process?", isPresented: Binding(get: { killTarget != nil }, set: { if !$0 { killTarget = nil } })) {
+            Button("Cancel", role: .cancel) { }
+            Button(killTarget?.force == true ? "Force Kill" : "Terminate", role: .destructive) {
+                if let target = killTarget {
+                    store.killProcess(pid: target.pid, force: target.force)
+                }
+            }
+        } message: {
+            if let target = killTarget {
+                Text("PID \(target.pid) — \(target.force ? "SIGKILL (force)" : "SIGTERM (graceful)")")
+            }
+        }
     }
 
     // MARK: - Row Background
@@ -125,6 +138,34 @@ struct SessionTableView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: alignment)
             .background(rowBackgroundColor(for: row)?.opacity(0.15) ?? .clear)
             .contentShape(Rectangle())
+            .contextMenu { sessionContextMenu(for: row) }
+    }
+
+    @ViewBuilder
+    private func sessionContextMenu(for row: RowItem) -> some View {
+        if case .session(let session) = row {
+            Button("Copy Session ID") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(session.sessionId, forType: .string)
+            }
+
+            Divider()
+
+            if let pids = store.pidsBySessionId[session.sessionId], !pids.isEmpty {
+                ForEach(pids, id: \.self) { pid in
+                    Section("PID \(pid)") {
+                        Button("Terminate (SIGTERM)") {
+                            killTarget = (pid, false)
+                        }
+                        Button("Force Kill (SIGKILL)") {
+                            killTarget = (pid, true)
+                        }
+                    }
+                }
+            } else {
+                Text("No process found")
+            }
+        }
     }
 
     // MARK: - Cell Views
@@ -198,8 +239,19 @@ struct SessionTableView: View {
     private func modelCell(for row: RowItem) -> some View {
         switch row {
         case .session(let session):
-            Text(session.shortModel)
-                .foregroundStyle(.secondary)
+            HStack(spacing: 2) {
+                Text(session.shortModel)
+                if session.hasLargeContext {
+                    Text("1M")
+                        .font(.system(size: 7, weight: .bold))
+                        .padding(.horizontal, 2)
+                        .padding(.vertical, 0.5)
+                        .background(Color.secondary.opacity(0.25))
+                        .clipShape(Capsule())
+                }
+            }
+            .foregroundStyle(.secondary)
+            .help(session.model)
         case .subagent:
             Text("")
         }
@@ -260,11 +312,11 @@ struct SessionTableView: View {
     private func topicCell(for row: RowItem) -> some View {
         switch row {
         case .session(let session):
-            Text(session.topic)
+            Text(session.displayTopic)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .truncationMode(.tail)
-                .help(session.topic)
+                .help(session.topic.isEmpty ? session.displayTopic : session.topic)
         case .subagent:
             Text("")
         }
@@ -324,22 +376,36 @@ private struct UsageBarView: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            if let w = usage.fiveHour {
-                usageLabel("Session", window: w)
+            if let limits = usage.limits, !limits.isEmpty {
+                // Modern canonical source: one label per limit, binding one bold.
+                ForEach(limits) { limit in
+                    usageLabel(limit.label,
+                               percent: limit.percent,
+                               reset: limit.formattedResetTime,
+                               emphasized: limit.isActive == true)
+                }
+            } else {
+                // Fallback to the legacy flat windows.
+                if let w = usage.fiveHour {
+                    usageLabel("Session", percent: Int(w.utilization), reset: w.formattedResetTime, emphasized: false)
+                }
+                if let w = usage.sevenDay {
+                    usageLabel("Week", percent: Int(w.utilization), reset: w.formattedResetTime, emphasized: false)
+                }
             }
-            if let w = usage.sevenDay {
-                usageLabel("Week", window: w)
+            if let extra = usage.extraUsage, extra.isEnabled, let u = extra.utilization {
+                usageLabel("Extra", percent: Int(u), reset: nil, emphasized: false)
             }
         }
     }
 
-    private func usageLabel(_ label: String, window: UsageWindow) -> some View {
+    private func usageLabel(_ label: String, percent: Int, reset: String?, emphasized: Bool) -> some View {
         HStack(spacing: 3) {
             Text("\(label):")
                 .foregroundStyle(.white)
-            Text("\(Int(window.utilization))%")
-                .foregroundStyle(utilizationColor(window.utilization))
-            if let reset = window.formattedResetTime {
+            Text("\(percent)%")
+                .foregroundStyle(utilizationColor(Double(percent)))
+            if let reset {
                 Text("·")
                     .foregroundStyle(.white)
                 Text(reset)
@@ -347,6 +413,7 @@ private struct UsageBarView: View {
             }
         }
         .font(.caption)
+        .fontWeight(emphasized ? .semibold : .regular)
     }
 
     private func utilizationColor(_ value: Double) -> Color {

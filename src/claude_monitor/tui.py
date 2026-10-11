@@ -19,17 +19,14 @@ STATUS_DISPLAY = {
     "ENDED": ("ENDED", "dim"),
 }
 
-MODEL_SHORT = {
-    "claude-opus-4-6": "opus",
-    "claude-sonnet-4-6": "sonnet",
-    "claude-haiku-4-5-20251001": "haiku",
-}
+MODEL_FAMILIES = ("opus", "sonnet", "haiku", "fable")
 
 MODE_SHORT = {
     "default": "default",
     "plan": "plan",
     "acceptEdits": "autoEdit",
-    "dontAsk": "dontAsk",
+    "auto": "auto",
+    "dontAsk": "auto",  # legacy name for auto mode
     "bypassPermissions": "bypass",
 }
 
@@ -62,10 +59,19 @@ def _format_duration(started_at: str) -> str:
 
 
 def _short_model(model: str) -> str:
-    """Shorten model name."""
+    """Shorten a model id to its family name (robust to version suffixes).
+
+    Matching on the family keeps working as new model ids appear (e.g.
+    ``claude-opus-4-8`` -> ``opus``); the old ``split("-")[-1]`` fallback used
+    to return the version digit (``8``) for unknown ids.
+    """
     if not model:
         return "-"
-    return MODEL_SHORT.get(model, model.split("-")[-1] if "-" in model else model)
+    lowered = model.lower()
+    for family in MODEL_FAMILIES:
+        if family in lowered:
+            return family
+    return model
 
 
 def _short_mode(mode: str) -> str:
@@ -134,12 +140,15 @@ class ClaudeMonitorApp(App):
             styled_status = f"[{color}]{status_label}[/]"
             tool = s.tool_name or "-"
             model = _short_model(s.model)
+            if "[1m]" in s.model.lower():
+                model += " 1M"
             mode = _short_mode(s.permission_mode)
             tools = str(s.tool_count) if s.tool_count else "-"
             duration = _format_duration(s.started_at)
             updated = _format_time(s.last_updated)
             project = s.project or s.cwd or "-"
-            topic = _truncate(s.topic, 50) if s.topic else _truncate(s.last_prompt, 50)
+            # Prefer the AI-generated title, then latest prompt/topic
+            topic = _truncate(s.title or s.topic or s.last_prompt, 50)
 
             table.add_row(
                 project, styled_status, tool, model, mode,
